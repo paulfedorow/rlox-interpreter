@@ -386,3 +386,114 @@ fn is_alpha_numeric(c: u8) -> bool {
 fn is_digit(c: u8) -> bool {
     c >= b'0' && c <= b'9'
 }
+
+enum Expr {
+    Assign {
+        name: Token,
+        value: Box<Expr>,
+    },
+
+    Binary {
+        left: Box<Expr>,
+        operator: Token,
+        right: Box<Expr>,
+    },
+
+    Call {
+        callee: Box<Expr>,
+        paren: Token,
+        arguments: Vec<Expr>,
+    },
+
+    Get {
+        object: Box<Expr>,
+        name: Token,
+    },
+
+    Grouping {
+        expression: Box<Expr>,
+    },
+
+    Literal {
+        value: TokenLiteral,
+    },
+
+    Logical {
+        left: Box<Expr>,
+        operator: Token,
+        right: Box<Expr>,
+    },
+
+    Set {
+        object: Box<Expr>,
+        name: Token,
+        value: Box<Expr>,
+    },
+
+    Super {
+        keyword: Token,
+        method: Token,
+    },
+
+    This {
+        keyword: Token,
+    },
+
+    Unary {
+        operator: Token,
+        right: Box<Expr>,
+    },
+
+    Variable(ExprVariable),
+}
+
+struct ExprVariable {
+    name: Token,
+}
+
+struct StmtFunction {
+    name: Token,
+    params: Vec<Token>,
+    body: Vec<Stmt>,
+}
+
+enum Stmt {
+    Block {
+        statements: Vec<Stmt>,
+    },
+
+    Class {
+        name: Token,
+        superclass: ExprVariable,
+        methods: Vec<StmtFunction>,
+    },
+
+    Expression(Expr),
+
+    Function(StmtFunction),
+
+    If {
+        condition: Expr,
+        then_branch: Box<Stmt>,
+        else_branch: Box<Stmt>,
+    },
+
+    Print {
+        expression: Expr,
+    },
+
+    Return {
+        keyword: Token,
+        value: Expr,
+    },
+
+    Var {
+        name: Token,
+        initializer: Expr,
+    },
+
+    While {
+        condition: Expr,
+        body: Box<Stmt>,
+    },
+}
