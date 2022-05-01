@@ -840,8 +840,8 @@ impl Interpreter<'_> {
             Expr::Grouping { expression } => self.evaluate(expression),
             Expr::Literal { value } => match value {
                 TokenLiteral::String(str) => Ok(Value::String(str.clone())),
-                TokenLiteral::Number(num) => Ok(Value::Number(num.clone())),
-                TokenLiteral::Bool(bool) => Ok(Value::Bool(bool.clone())),
+                TokenLiteral::Number(num) => Ok(Value::Number(*num)),
+                TokenLiteral::Bool(bool) => Ok(Value::Bool(*bool)),
                 TokenLiteral::Nil => Ok(Value::Nil),
             },
             Expr::Unary { operator, right } => {
@@ -866,8 +866,8 @@ impl Interpreter<'_> {
         operand: &Value,
     ) -> Result<f64, (Token, String)> {
         match operand {
-            Value::Number(num) => Ok(num.clone()),
-            _ => Err((operator.clone(), "Operand must be a number.".to_string())),
+            Value::Number(num) => Ok(*num),
+            _ => Err((operator.clone(), String::from("Operand must be a number."))),
         }
     }
 
@@ -878,10 +878,8 @@ impl Interpreter<'_> {
         right: &Value,
     ) -> Result<(f64, f64), (Token, String)> {
         match (left, right) {
-            (Value::Number(left_num), Value::Number(right_num)) => {
-                Ok((left_num.clone(), right_num.clone()))
-            }
-            _ => Err((operator.clone(), "Operands must be a number.".to_string())),
+            (Value::Number(left_num), Value::Number(right_num)) => Ok((*left_num, *right_num)),
+            _ => Err((operator.clone(), String::from("Operands must be a number."))),
         }
     }
 }
@@ -904,11 +902,11 @@ fn stringify(value: &Value) -> String {
         Value::Number(num) => format!("{}", num),
         Value::Bool(b) => {
             if *b {
-                "true".to_string()
+                String::from("true")
             } else {
-                "false".to_string()
+                String::from("false")
             }
         }
-        Value::Nil => "nil".to_string(),
+        Value::Nil => String::from("nil"),
     }
 }
