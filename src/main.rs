@@ -19,11 +19,15 @@ fn main() {
 
 struct App {
     had_error: bool,
+    had_runtime_error: bool,
 }
 
 impl App {
     fn new() -> App {
-        return App { had_error: false };
+        return App {
+            had_error: false,
+            had_runtime_error: false,
+        };
     }
 
     fn error(&mut self, line: u64, message: &str) {
@@ -36,6 +40,11 @@ impl App {
         } else {
             self.report(token.line, &format!(" at '{}'", token.lexeme), message);
         }
+    }
+
+    fn runtime_error(&mut self, token: &Token, message: &str) {
+        self.had_runtime_error = true;
+        eprintln!("{}\n[line {}]", message, token.line);
     }
 
     fn report(&mut self, line: u64, origin: &str, message: &str) {
@@ -92,7 +101,12 @@ impl App {
         let mut parser = Parser::new(self, tokens);
         let expression = parser.parse();
 
-        dbg!(expression);
+        if self.had_error || expression.is_none() {
+            return;
+        }
+
+        let mut interpreter = Interpreter::new(self);
+        interpreter.interpret(&expression.unwrap());
     }
 }
 
@@ -128,7 +142,7 @@ impl Scanner<'_> {
         self.tokens.push(Token {
             token_type: TokenType::Eof,
             lexeme: "".to_string(),
-            literal: TokenLiteral::None,
+            literal: TokenLiteral::Nil,
             line: self.line,
         });
 
@@ -310,7 +324,7 @@ impl Scanner<'_> {
     }
 
     fn add_token(&mut self, token_type: TokenType) {
-        self.add_token_with_literal(token_type, TokenLiteral::None);
+        self.add_token_with_literal(token_type, TokenLiteral::Nil);
     }
 
     fn add_token_with_literal(&mut self, token_type: TokenType, literal: TokenLiteral) {
@@ -385,7 +399,6 @@ enum TokenLiteral {
     Number(f64),
     Bool(bool),
     Nil,
-    None,
 }
 
 fn is_alpha(c: u8) -> bool {
@@ -733,5 +746,169 @@ impl Parser<'_> {
 
     fn previous_token(&self) -> &Token {
         &self.tokens[self.current - 1]
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Value {
+    String(String),
+    Number(f64),
+    Bool(bool),
+    Nil,
+}
+
+struct Interpreter<'a> {
+    app: &'a mut App,
+}
+
+impl Interpreter<'_> {
+    fn new(app: &mut App) -> Interpreter {
+        Interpreter { app }
+    }
+
+    fn interpret(&mut self, expr: &Expr) {
+        let value = self.evaluate(expr);
+        match value {
+            Ok(value) => println!("{}", stringify(&value)),
+            Err((token, message)) => self.app.runtime_error(&token, &message),
+        }
+    }
+
+    fn evaluate(&mut self, expr: &Expr) -> Result<Value, (Token, String)> {
+        match expr {
+            Expr::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left = self.evaluate(left)?;
+                let right = self.evaluate(right)?;
+
+                match operator.token_type {
+                    TokenType::Minus => {
+                        let (left_num, right_num) =
+                            self.check_number_operands(operator, &left, &right)?;
+                        Ok(Value::Number(left_num - right_num))
+                    }
+                    TokenType::Slash => {
+                        let (left_num, right_num) =
+                            self.check_number_operands(operator, &left, &right)?;
+                        Ok(Value::Number(left_num / right_num))
+                    }
+                    TokenType::Star => {
+                        let (left_num, right_num) =
+                            self.check_number_operands(operator, &left, &right)?;
+                        Ok(Value::Number(left_num * right_num))
+                    }
+                    TokenType::Plus => match (left, right) {
+                        (Value::Number(left_num), Value::Number(right_num)) => {
+                            Ok(Value::Number(left_num + right_num))
+                        }
+                        (Value::String(left_str), Value::String(right_str)) => {
+                            Ok(Value::String(left_str + &right_str))
+                        }
+                        _ => Err((
+                            operator.clone(),
+                            "Operands must be two numbers or two strings.".to_string(),
+                        )),
+                    },
+                    TokenType::Greater => {
+                        let (left_num, right_num) =
+                            self.check_number_operands(operator, &left, &right)?;
+                        Ok(Value::Bool(left_num > right_num))
+                    }
+                    TokenType::GreaterEqual => {
+                        let (left_num, right_num) =
+                            self.check_number_operands(operator, &left, &right)?;
+                        Ok(Value::Bool(left_num >= right_num))
+                    }
+                    TokenType::Less => {
+                        let (left_num, right_num) =
+                            self.check_number_operands(operator, &left, &right)?;
+                        Ok(Value::Bool(left_num < right_num))
+                    }
+                    TokenType::LessEqual => {
+                        let (left_num, right_num) =
+                            self.check_number_operands(operator, &left, &right)?;
+                        Ok(Value::Bool(left_num <= right_num))
+                    }
+                    TokenType::BangEqual => Ok(Value::Bool(!is_equal(&left, &right))),
+                    TokenType::EqualEqual => Ok(Value::Bool(is_equal(&left, &right))),
+                    _ => panic!("Unexpected binary operator token."),
+                }
+            }
+            Expr::Grouping { expression } => self.evaluate(expression),
+            Expr::Literal { value } => match value {
+                TokenLiteral::String(str) => Ok(Value::String(str.clone())),
+                TokenLiteral::Number(num) => Ok(Value::Number(num.clone())),
+                TokenLiteral::Bool(bool) => Ok(Value::Bool(bool.clone())),
+                TokenLiteral::Nil => Ok(Value::Nil),
+            },
+            Expr::Unary { operator, right } => {
+                let right = self.evaluate(right)?;
+
+                match operator.token_type {
+                    TokenType::Bang => Ok(Value::Bool(!is_truthy(&right))),
+                    TokenType::Minus => {
+                        let num = self.check_number_operand(operator, &right);
+                        Ok(Value::Number(-(num?)))
+                    }
+                    _ => panic!("Unexpected unary operator token."),
+                }
+            }
+            _ => panic!("Expression node is not supported yet."),
+        }
+    }
+
+    fn check_number_operand(
+        &mut self,
+        operator: &Token,
+        operand: &Value,
+    ) -> Result<f64, (Token, String)> {
+        match operand {
+            Value::Number(num) => Ok(num.clone()),
+            _ => Err((operator.clone(), "Operand must be a number.".to_string())),
+        }
+    }
+
+    fn check_number_operands(
+        &mut self,
+        operator: &Token,
+        left: &Value,
+        right: &Value,
+    ) -> Result<(f64, f64), (Token, String)> {
+        match (left, right) {
+            (Value::Number(left_num), Value::Number(right_num)) => {
+                Ok((left_num.clone(), right_num.clone()))
+            }
+            _ => Err((operator.clone(), "Operands must be a number.".to_string())),
+        }
+    }
+}
+
+fn is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Bool(bool) => bool.clone(),
+        Value::Nil => false,
+        _ => true,
+    }
+}
+
+fn is_equal(left: &Value, right: &Value) -> bool {
+    left == right
+}
+
+fn stringify(value: &Value) -> String {
+    match value {
+        Value::String(str) => str.to_string(),
+        Value::Number(num) => format!("{}", num),
+        Value::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Value::Nil => "nil".to_string(),
     }
 }
