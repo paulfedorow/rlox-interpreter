@@ -209,7 +209,7 @@ impl Scanner<'_> {
             self.advance();
         }
 
-        let text = &self.source[self.start..=self.current];
+        let text = &self.source[self.start..self.current];
         let token_type = match text {
             b"and" => TokenType::And,
             b"class" => TokenType::Class,
