@@ -30,6 +30,14 @@ impl App {
         self.report(line, "", message);
     }
 
+    fn error_token(&mut self, token: &Token, message: &str) {
+        if token.token_type == TokenType::Eof {
+            self.report(token.line, " at end", message);
+        } else {
+            self.report(token.line, &format!(" at '{}'", token.lexeme), message);
+        }
+    }
+
     fn report(&mut self, line: u64, origin: &str, message: &str) {
         self.had_error = true;
         eprintln!("[line {}] Error{}: {}", line, origin, message);
@@ -81,7 +89,10 @@ impl App {
     fn run(&mut self, source: &str) {
         let mut scanner = Scanner::new(self, source.as_bytes());
         let tokens = scanner.scan_tokens();
-        dbg!(tokens);
+        let mut parser = Parser::new(self, tokens);
+        let expression = parser.parse();
+
+        dbg!(expression);
     }
 }
 
@@ -372,6 +383,8 @@ struct Token {
 enum TokenLiteral {
     String(String),
     Number(f64),
+    Bool(bool),
+    Nil,
     None,
 }
 
@@ -387,6 +400,7 @@ fn is_digit(c: u8) -> bool {
     c >= b'0' && c <= b'9'
 }
 
+#[derive(Debug)]
 enum Expr {
     Assign {
         name: Token,
@@ -447,6 +461,7 @@ enum Expr {
     Variable(ExprVariable),
 }
 
+#[derive(Debug)]
 struct ExprVariable {
     name: Token,
 }
@@ -496,4 +511,227 @@ enum Stmt {
         condition: Expr,
         body: Box<Stmt>,
     },
+}
+
+struct Parser<'a> {
+    tokens: Vec<Token>,
+    current: usize,
+    app: &'a mut App,
+}
+
+impl Parser<'_> {
+    fn new(app: &mut App, tokens: Vec<Token>) -> Parser {
+        Parser {
+            tokens,
+            current: 0,
+            app,
+        }
+    }
+
+    fn expression(&mut self) -> Option<Expr> {
+        self.equality()
+    }
+
+    fn equality(&mut self) -> Option<Expr> {
+        let mut expr = self.comparison();
+
+        if expr.is_none() {
+            return None;
+        }
+
+        while self.match_one_of([TokenType::BangEqual, TokenType::BangEqual]) {
+            let operator = self.previous_token().clone();
+            let right = self.comparison()?;
+            expr = Some(Expr::Binary {
+                left: Box::from(expr?),
+                operator,
+                right: Box::from(right),
+            })
+        }
+
+        expr
+    }
+
+    fn comparison(&mut self) -> Option<Expr> {
+        let mut expr = self.term();
+
+        if expr.is_none() {
+            return None;
+        }
+
+        while self.match_one_of([
+            TokenType::Greater,
+            TokenType::GreaterEqual,
+            TokenType::Less,
+            TokenType::LessEqual,
+        ]) {
+            let operator = self.previous_token().clone();
+            let right = self.term()?;
+            expr = Some(Expr::Binary {
+                left: Box::new(expr?),
+                operator,
+                right: Box::new(right),
+            })
+        }
+
+        expr
+    }
+
+    fn term(&mut self) -> Option<Expr> {
+        let mut expr = self.factor();
+
+        if expr.is_none() {
+            return None;
+        }
+
+        while self.match_one_of([TokenType::Minus, TokenType::Plus]) {
+            let operator = self.previous_token().clone();
+            let right = self.factor()?;
+            expr = Some(Expr::Binary {
+                left: Box::new(expr?),
+                operator,
+                right: Box::new(right),
+            })
+        }
+
+        expr
+    }
+
+    fn factor(&mut self) -> Option<Expr> {
+        let mut expr = self.unary();
+
+        if expr.is_none() {
+            return None;
+        }
+
+        while self.match_one_of([TokenType::Slash, TokenType::Star]) {
+            let operator = self.previous_token().clone();
+            let right = self.unary()?;
+            expr = Some(Expr::Binary {
+                left: Box::new(expr?),
+                operator,
+                right: Box::new(right),
+            })
+        }
+
+        expr
+    }
+
+    fn unary(&mut self) -> Option<Expr> {
+        if self.match_one_of([TokenType::Bang, TokenType::Minus]) {
+            let operator = self.previous_token().clone();
+            let right = self.unary()?;
+            Some(Expr::Unary {
+                operator,
+                right: Box::new(right),
+            })
+        } else {
+            self.primary()
+        }
+    }
+
+    fn primary(&mut self) -> Option<Expr> {
+        if self.match_one_of([TokenType::False]) {
+            Some(Expr::Literal {
+                value: TokenLiteral::Bool(false),
+            })
+        } else if self.match_one_of([TokenType::True]) {
+            Some(Expr::Literal {
+                value: TokenLiteral::Bool(true),
+            })
+        } else if self.match_one_of([TokenType::Nil]) {
+            Some(Expr::Literal {
+                value: TokenLiteral::Nil,
+            })
+        } else if self.match_one_of([TokenType::Number, TokenType::String]) {
+            Some(Expr::Literal {
+                value: self.previous_token().literal.clone(),
+            })
+        } else if self.match_one_of([TokenType::LeftParen]) {
+            let expr = self.expression()?;
+            self.consume(TokenType::RightParen, "Expect ')' after expression.")?;
+            Some(Expr::Grouping {
+                expression: Box::new(expr),
+            })
+        } else {
+            self.app
+                .error_token(&self.peek_token().clone(), "Expect expression.");
+            None
+        }
+    }
+
+    fn parse(&mut self) -> Option<Expr> {
+        self.expression()
+    }
+
+    fn consume(&mut self, token_type: TokenType, message: &str) -> Option<Token> {
+        if self.check_token(token_type) {
+            Some(self.advance().clone())
+        } else {
+            self.app.error_token(&self.peek_token().clone(), message);
+            None
+        }
+    }
+
+    fn synchronize(&mut self) {
+        self.advance();
+
+        while !self.is_at_end() {
+            if self.previous_token().token_type == TokenType::Semicolon {
+                return;
+            }
+
+            match self.peek_token().token_type {
+                TokenType::Class
+                | TokenType::Fun
+                | TokenType::Var
+                | TokenType::For
+                | TokenType::If
+                | TokenType::While
+                | TokenType::Print
+                | TokenType::Return => return,
+                _ => {}
+            }
+
+            self.advance();
+        }
+    }
+
+    fn match_one_of<const N: usize>(&mut self, token_types: [TokenType; N]) -> bool {
+        for token_type in token_types {
+            if self.check_token(token_type) {
+                self.advance();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    fn check_token(&self, token_type: TokenType) -> bool {
+        if self.is_at_end() {
+            false
+        } else {
+            self.peek_token().token_type == token_type
+        }
+    }
+
+    fn advance(&mut self) -> &Token {
+        if !self.is_at_end() {
+            self.current += 1;
+        }
+        self.previous_token()
+    }
+
+    fn is_at_end(&self) -> bool {
+        self.peek_token().token_type == TokenType::Eof
+    }
+
+    fn peek_token(&self) -> &Token {
+        &self.tokens[self.current]
+    }
+
+    fn previous_token(&self) -> &Token {
+        &self.tokens[self.current - 1]
+    }
 }
