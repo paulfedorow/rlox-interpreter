@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::os::linux::raw::stat;
 use std::str::FromStr;
 use std::{env, fs, io, str};
 
@@ -6,10 +8,11 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     let mut app = App::new();
+    let mut interpreter = Interpreter::new();
 
     match &args[..] {
-        [_] => app.run_prompt(),
-        [_, path] => app.run_file(path),
+        [_] => app.run_prompt(&mut interpreter),
+        [_, path] => app.run_file(&mut interpreter, path),
         _ => {
             println!("Usage: rlox-interpreter [script]");
             std::process::exit(64);
@@ -52,11 +55,11 @@ impl App {
         eprintln!("[line {}] Error{}: {}", line, origin, message);
     }
 
-    fn run_file(&mut self, path: &str) {
+    fn run_file(&mut self, interpreter: &mut Interpreter, path: &str) {
         match fs::read_to_string(path) {
             Ok(content) => {
                 println!("{}", content.len());
-                self.run(&content);
+                self.run(interpreter, &content);
                 if self.had_error {
                     std::process::exit(65);
                 }
@@ -68,7 +71,7 @@ impl App {
         }
     }
 
-    fn run_prompt(&mut self) {
+    fn run_prompt(&mut self, interpreter: &mut Interpreter) {
         let mut line = String::with_capacity(1024);
         let stdin = io::stdin();
         let mut handle = stdin.lock();
@@ -84,7 +87,7 @@ impl App {
                         // we reached EOF (user probably pressed Ctrl+D)
                         std::process::exit(0);
                     }
-                    self.run(&line);
+                    self.run(interpreter, &line);
                     self.had_error = false;
                 }
                 Err(error) => {
@@ -95,18 +98,17 @@ impl App {
         }
     }
 
-    fn run(&mut self, source: &str) {
+    fn run(&mut self, interpreter: &mut Interpreter, source: &str) {
         let mut scanner = Scanner::new(self, source.as_bytes());
         let tokens = scanner.scan_tokens();
         let mut parser = Parser::new(self, tokens);
-        let expression = parser.parse();
+        let statements = parser.parse();
 
-        if self.had_error || expression.is_none() {
+        if self.had_error {
             return;
         }
 
-        let mut interpreter = Interpreter::new(self);
-        interpreter.interpret(&expression.unwrap());
+        interpreter.interpret(self, &statements);
     }
 }
 
@@ -517,7 +519,7 @@ enum Stmt {
 
     Var {
         name: Token,
-        initializer: Expr,
+        initializer: Option<Expr>,
     },
 
     While {
@@ -542,7 +544,32 @@ impl Parser<'_> {
     }
 
     fn expression(&mut self) -> Option<Expr> {
-        self.equality()
+        self.assignment()
+    }
+
+    fn assignment(&mut self) -> Option<Expr> {
+        let expr = self.equality()?;
+
+        if self.match_one_of([TokenType::Equal]) {
+            let value = self.assignment()?;
+            let equals = self.previous_token();
+
+            match expr {
+                Expr::Variable(ExprVariable { name }) => {
+                    return Some(Expr::Assign {
+                        name,
+                        value: Box::from(value),
+                    });
+                }
+                _ => {
+                    self.app
+                        .error_token(&equals.clone(), "Invalid assignment target.");
+                    return None;
+                }
+            }
+        }
+
+        Some(expr)
     }
 
     fn equality(&mut self) -> Option<Expr> {
@@ -660,6 +687,10 @@ impl Parser<'_> {
             Some(Expr::Literal {
                 value: self.previous_token().literal.clone(),
             })
+        } else if self.match_one_of([TokenType::Identifier]) {
+            Some(Expr::Variable(ExprVariable {
+                name: self.previous_token().clone(),
+            }))
         } else if self.match_one_of([TokenType::LeftParen]) {
             let expr = self.expression()?;
             self.consume(TokenType::RightParen, "Expect ')' after expression.")?;
@@ -673,8 +704,83 @@ impl Parser<'_> {
         }
     }
 
-    fn parse(&mut self) -> Option<Expr> {
-        self.expression()
+    fn parse(&mut self) -> Vec<Stmt> {
+        let mut statements = Vec::new();
+
+        while !self.is_at_end() {
+            match self.declaration() {
+                Some(statement) => statements.push(statement),
+                _ => {}
+            }
+        }
+
+        statements
+    }
+
+    fn statement(&mut self) -> Option<Stmt> {
+        if self.match_one_of([TokenType::Print]) {
+            self.print_statement()
+        } else if self.match_one_of([TokenType::LeftBrace]) {
+            Some(Stmt::Block {
+                statements: self.block()?,
+            })
+        } else {
+            self.expression_statement()
+        }
+    }
+
+    fn block(&mut self) -> Option<Vec<Stmt>> {
+        let mut statements = Vec::new();
+
+        while !self.check_token(TokenType::RightBrace) && !self.is_at_end() {
+            statements.push(self.declaration()?);
+        }
+
+        self.consume(TokenType::RightBrace, "Expect '}' after block.")?;
+
+        Some(statements)
+    }
+
+    fn print_statement(&mut self) -> Option<Stmt> {
+        let expression = self.expression()?;
+        self.consume(TokenType::Semicolon, "Expect ';' after value.")?;
+        Some(Stmt::Print { expression })
+    }
+
+    fn expression_statement(&mut self) -> Option<Stmt> {
+        let expression = self.expression()?;
+        self.consume(TokenType::Semicolon, "Expect ';' after expression.")?;
+        Some(Stmt::Expression(expression))
+    }
+
+    fn declaration(&mut self) -> Option<Stmt> {
+        if self.match_one_of([TokenType::Var]) {
+            self.var_declaration()
+        } else {
+            match self.statement() {
+                statement @ Some(_) => statement,
+                None => {
+                    self.synchronize();
+                    None
+                }
+            }
+        }
+    }
+
+    fn var_declaration(&mut self) -> Option<Stmt> {
+        let name = self.consume(TokenType::Identifier, "Expect variable name.")?;
+
+        let mut initializer = None;
+        if self.match_one_of([TokenType::Equal]) {
+            initializer = self.expression();
+        }
+
+        self.consume(
+            TokenType::Semicolon,
+            "Expect ';' after variable declaration.",
+        )?;
+
+        Some(Stmt::Var { name, initializer })
     }
 
     fn consume(&mut self, token_type: TokenType, message: &str) -> Option<Token> {
@@ -749,7 +855,7 @@ impl Parser<'_> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Value {
     String(String),
     Number(f64),
@@ -757,21 +863,64 @@ enum Value {
     Nil,
 }
 
-struct Interpreter<'a> {
-    app: &'a mut App,
+struct Interpreter {
+    environment: Environment,
 }
 
-impl Interpreter<'_> {
-    fn new(app: &mut App) -> Interpreter {
-        Interpreter { app }
+impl Interpreter {
+    fn new() -> Interpreter {
+        Interpreter {
+            environment: Environment::new(None),
+        }
     }
 
-    fn interpret(&mut self, expr: &Expr) {
-        let value = self.evaluate(expr);
-        match value {
-            Ok(value) => println!("{}", stringify(&value)),
-            Err((token, message)) => self.app.runtime_error(&token, &message),
+    fn interpret(&mut self, app: &mut App, statements: &[Stmt]) {
+        for statement in statements {
+            match self.execute(statement) {
+                Ok(_) => {}
+                Err((token, message)) => {
+                    app.runtime_error(&token, &message);
+                    break;
+                }
+            }
         }
+    }
+
+    fn execute(&mut self, statement: &Stmt) -> Result<(), (Token, String)> {
+        match statement {
+            Stmt::Expression(expr) => {
+                self.evaluate(expr)?;
+            }
+            Stmt::Print { expression } => {
+                let value = self.evaluate(expression)?;
+                println!("{}", stringify(&value));
+            }
+            Stmt::Var { name, initializer } => {
+                let value = match initializer {
+                    Some(expr) => self.evaluate(&expr)?,
+                    _ => Value::Nil,
+                };
+                self.environment.define(name.lexeme.clone(), value.clone());
+            }
+            Stmt::Block { statements } => {
+                let previous = self.environment.clone();
+                self.environment = Environment::new(Some(self.environment.clone()));
+
+                let mut ret = Ok(());
+                for statement in statements {
+                    ret = self.execute(statement);
+                    if ret.is_err() {
+                        break;
+                    }
+                }
+
+                self.environment = previous;
+
+                return ret;
+            }
+            _ => panic!("Statement node is not supported yet."),
+        }
+        Ok(())
     }
 
     fn evaluate(&mut self, expr: &Expr) -> Result<Value, (Token, String)> {
@@ -856,6 +1005,14 @@ impl Interpreter<'_> {
                     _ => panic!("Unexpected unary operator token."),
                 }
             }
+            Expr::Variable(ExprVariable { name }) => {
+                self.environment.get(name).map(|value| value.clone())
+            }
+            Expr::Assign { name, value } => {
+                let value = self.evaluate(&value).map(|value| value.clone());
+                self.environment.assign(&name, value.clone()?)?;
+                value
+            }
             _ => panic!("Expression node is not supported yet."),
         }
     }
@@ -908,5 +1065,53 @@ fn stringify(value: &Value) -> String {
             }
         }
         Value::Nil => String::from("nil"),
+    }
+}
+
+#[derive(Clone)]
+struct Environment {
+    values: HashMap<String, Value>,
+    enclosing: Option<Box<Environment>>,
+}
+
+impl Environment {
+    fn new(enclosing: Option<Environment>) -> Environment {
+        Environment {
+            values: HashMap::new(),
+            enclosing: enclosing.map(|env| Box::from(env)),
+        }
+    }
+
+    fn define(&mut self, name: String, value: Value) {
+        self.values.insert(name, value);
+    }
+
+    fn assign(&mut self, name: &Token, value: Value) -> Result<(), (Token, String)> {
+        match self.values.get(&name.lexeme) {
+            Some(_) => {
+                self.values.insert(name.lexeme.clone(), value);
+                Ok(())
+            }
+            None => self.enclosing.as_mut().map_or(
+                Err((
+                    name.clone(),
+                    format!("Undefined variable '{}'.", name.lexeme),
+                )),
+                |enclosing| enclosing.assign(name, value).clone(),
+            ),
+        }
+    }
+
+    fn get(&mut self, name: &Token) -> Result<&Value, (Token, String)> {
+        match self.values.get(&name.lexeme) {
+            Some(value) => Ok(value),
+            None => self.enclosing.as_mut().map_or(
+                Err((
+                    name.clone(),
+                    format!("Undefined variable '{}'.", name.lexeme),
+                )),
+                |enclosing| enclosing.get(name).clone(),
+            ),
+        }
     }
 }
