@@ -26,10 +26,10 @@ struct App {
 
 impl App {
     fn new() -> App {
-        return App {
+        App {
             had_error: false,
             had_runtime_error: false,
-        };
+        }
     }
 
     fn error(&mut self, line: u64, message: &str) {
@@ -121,14 +121,14 @@ struct Scanner<'a> {
 
 impl Scanner<'_> {
     fn new<'a>(app: &'a mut App, source: &'a [u8]) -> Scanner<'a> {
-        return Scanner {
+        Scanner {
             source,
             line: 1,
             start: 0,
             current: 0,
             tokens: vec![],
             app,
-        };
+        }
     }
 
     pub fn scan_tokens(&mut self) -> Vec<Token> {
@@ -402,7 +402,7 @@ enum TokenLiteral {
 }
 
 fn is_alpha(c: u8) -> bool {
-    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'A') || c == b'_'
+    (b'a'..=b'z').contains(&c) || (b'A'..=b'Z').contains(&c) || c == b'_'
 }
 
 fn is_alpha_numeric(c: u8) -> bool {
@@ -410,7 +410,7 @@ fn is_alpha_numeric(c: u8) -> bool {
 }
 
 fn is_digit(c: u8) -> bool {
-    c >= b'0' && c <= b'9'
+    (b'0'..=b'9').contains(&c)
 }
 
 #[derive(Debug)]
@@ -550,7 +550,7 @@ impl Parser<'_> {
 
         if self.match_one_of([TokenType::Equal]) {
             let value = self.assignment()?;
-            let equals = self.previous_token();
+            let equals = self.previous_token().clone();
 
             return match expr {
                 Expr::Variable(ExprVariable { name }) => Some(Expr::Assign {
@@ -558,8 +558,7 @@ impl Parser<'_> {
                     value: Box::from(value),
                 }),
                 _ => {
-                    self.app
-                        .error_token(&equals.clone(), "Invalid assignment target.");
+                    self.app.error_token(&equals, "Invalid assignment target.");
                     None
                 }
             };
@@ -571,9 +570,7 @@ impl Parser<'_> {
     fn or(&mut self) -> Option<Expr> {
         let mut expr = self.and();
 
-        if expr.is_none() {
-            return None;
-        }
+        expr.as_ref()?;
 
         while self.match_one_of([TokenType::Or]) {
             let operator = self.previous_token().clone();
@@ -591,9 +588,7 @@ impl Parser<'_> {
     fn and(&mut self) -> Option<Expr> {
         let mut expr = self.equality();
 
-        if expr.is_none() {
-            return None;
-        }
+        expr.as_ref()?;
 
         while self.match_one_of([TokenType::And]) {
             let operator = self.previous_token().clone();
@@ -611,9 +606,7 @@ impl Parser<'_> {
     fn equality(&mut self) -> Option<Expr> {
         let mut expr = self.comparison();
 
-        if expr.is_none() {
-            return None;
-        }
+        expr.as_ref()?;
 
         while self.match_one_of([TokenType::BangEqual, TokenType::BangEqual]) {
             let operator = self.previous_token().clone();
@@ -631,9 +624,7 @@ impl Parser<'_> {
     fn comparison(&mut self) -> Option<Expr> {
         let mut expr = self.term();
 
-        if expr.is_none() {
-            return None;
-        }
+        expr.as_ref()?;
 
         while self.match_one_of([
             TokenType::Greater,
@@ -656,9 +647,7 @@ impl Parser<'_> {
     fn term(&mut self) -> Option<Expr> {
         let mut expr = self.factor();
 
-        if expr.is_none() {
-            return None;
-        }
+        expr.as_ref()?;
 
         while self.match_one_of([TokenType::Minus, TokenType::Plus]) {
             let operator = self.previous_token().clone();
@@ -676,9 +665,7 @@ impl Parser<'_> {
     fn factor(&mut self) -> Option<Expr> {
         let mut expr = self.unary();
 
-        if expr.is_none() {
-            return None;
-        }
+        expr.as_ref()?;
 
         while self.match_one_of([TokenType::Slash, TokenType::Star]) {
             let operator = self.previous_token().clone();
@@ -744,9 +731,8 @@ impl Parser<'_> {
         let mut statements = Vec::new();
 
         while !self.is_at_end() {
-            match self.declaration() {
-                Some(statement) => statements.push(statement),
-                _ => {}
+            if let Some(statement) = self.declaration() {
+                statements.push(statement);
             }
         }
 
@@ -947,7 +933,7 @@ impl Parser<'_> {
             }
         }
 
-        return false;
+        false
     }
 
     fn check_token(&self, token_type: TokenType) -> bool {
@@ -1020,10 +1006,10 @@ impl Interpreter {
             }
             Stmt::Var { name, initializer } => {
                 let value = match initializer {
-                    Some(expr) => self.evaluate(&expr)?,
+                    Some(expr) => self.evaluate(expr)?,
                     _ => Value::Nil,
                 };
-                self.environment.define(name.lexeme.clone(), value.clone());
+                self.environment.define(name.lexeme.clone(), value);
             }
             Stmt::Block { statements } => {
                 let mut old_environment = Environment::new();
@@ -1149,8 +1135,8 @@ impl Interpreter {
                 self.environment.get(name).map(|value| value.clone())
             }
             Expr::Assign { name, value } => {
-                let value = self.evaluate(&value).map(|value| value.clone());
-                self.environment.assign(&name, value.clone()?)?;
+                let value = self.evaluate(value);
+                self.environment.assign(name, value.clone()?)?;
                 value
             }
             Expr::Logical {
@@ -1158,16 +1144,14 @@ impl Interpreter {
                 operator,
                 right,
             } => {
-                let left = self.evaluate(&left)?;
+                let left = self.evaluate(left)?;
 
                 if operator.token_type == TokenType::Or {
                     if is_truthy(&left) {
                         return Ok(left);
                     }
-                } else {
-                    if !is_truthy(&left) {
-                        return Ok(left);
-                    }
+                } else if !is_truthy(&left) {
+                    return Ok(left);
                 }
 
                 self.evaluate(right)
@@ -1202,7 +1186,7 @@ impl Interpreter {
 
 fn is_truthy(value: &Value) -> bool {
     match value {
-        Value::Bool(bool) => bool.clone(),
+        Value::Bool(bool) => *bool,
         Value::Nil => false,
         _ => true,
     }
@@ -1256,7 +1240,7 @@ impl Environment {
                     name.clone(),
                     format!("Undefined variable '{}'.", name.lexeme),
                 )),
-                |enclosing| enclosing.assign(name, value).clone(),
+                |enclosing| enclosing.assign(name, value),
             ),
         }
     }
@@ -1269,7 +1253,7 @@ impl Environment {
                     name.clone(),
                     format!("Undefined variable '{}'.", name.lexeme),
                 )),
-                |enclosing| enclosing.get(name).clone(),
+                |enclosing| enclosing.get(name),
             ),
         }
     }
