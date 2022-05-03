@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::os::linux::raw::stat;
 use std::str::FromStr;
 use std::{env, fs, io, str};
 
@@ -504,7 +503,7 @@ enum Stmt {
     If {
         condition: Expr,
         then_branch: Box<Stmt>,
-        else_branch: Box<Stmt>,
+        else_branch: Option<Box<Stmt>>,
     },
 
     Print {
@@ -547,28 +546,66 @@ impl Parser<'_> {
     }
 
     fn assignment(&mut self) -> Option<Expr> {
-        let expr = self.equality()?;
+        let expr = self.or()?;
 
         if self.match_one_of([TokenType::Equal]) {
             let value = self.assignment()?;
             let equals = self.previous_token();
 
-            match expr {
-                Expr::Variable(ExprVariable { name }) => {
-                    return Some(Expr::Assign {
-                        name,
-                        value: Box::from(value),
-                    });
-                }
+            return match expr {
+                Expr::Variable(ExprVariable { name }) => Some(Expr::Assign {
+                    name,
+                    value: Box::from(value),
+                }),
                 _ => {
                     self.app
                         .error_token(&equals.clone(), "Invalid assignment target.");
-                    return None;
+                    None
                 }
-            }
+            };
         }
 
         Some(expr)
+    }
+
+    fn or(&mut self) -> Option<Expr> {
+        let mut expr = self.and();
+
+        if expr.is_none() {
+            return None;
+        }
+
+        while self.match_one_of([TokenType::Or]) {
+            let operator = self.previous_token().clone();
+            let right = self.and()?;
+            expr = Some(Expr::Logical {
+                left: Box::from(expr?),
+                operator,
+                right: Box::from(right),
+            });
+        }
+
+        expr
+    }
+
+    fn and(&mut self) -> Option<Expr> {
+        let mut expr = self.equality();
+
+        if expr.is_none() {
+            return None;
+        }
+
+        while self.match_one_of([TokenType::And]) {
+            let operator = self.previous_token().clone();
+            let right = self.equality()?;
+            expr = Some(Expr::Logical {
+                left: Box::from(expr?),
+                operator,
+                right: Box::from(right),
+            });
+        }
+
+        expr
     }
 
     fn equality(&mut self) -> Option<Expr> {
@@ -717,8 +754,14 @@ impl Parser<'_> {
     }
 
     fn statement(&mut self) -> Option<Stmt> {
-        if self.match_one_of([TokenType::Print]) {
+        if self.match_one_of([TokenType::For]) {
+            self.for_statement()
+        } else if self.match_one_of([TokenType::If]) {
+            self.if_statement()
+        } else if self.match_one_of([TokenType::Print]) {
             self.print_statement()
+        } else if self.match_one_of([TokenType::While]) {
+            self.while_statement()
         } else if self.match_one_of([TokenType::LeftBrace]) {
             Some(Stmt::Block {
                 statements: self.block()?,
@@ -740,10 +783,91 @@ impl Parser<'_> {
         Some(statements)
     }
 
+    fn for_statement(&mut self) -> Option<Stmt> {
+        self.consume(TokenType::LeftParen, "Expect '(' after 'for'.")?;
+
+        let initializer = if self.match_one_of([TokenType::Semicolon]) {
+            None
+        } else if self.match_one_of([TokenType::Var]) {
+            Some(self.var_declaration()?)
+        } else {
+            Some(self.expression_statement()?)
+        };
+
+        let condition = if !self.check_token(TokenType::Semicolon) {
+            Some(self.expression()?)
+        } else {
+            None
+        };
+
+        self.consume(TokenType::Semicolon, "Expect ';' after loop condition.")?;
+
+        let increment = if !self.check_token(TokenType::RightParen) {
+            Some(self.expression()?)
+        } else {
+            None
+        };
+
+        self.consume(TokenType::RightParen, "Expect ')' after for clauses.")?;
+
+        let mut body = self.statement()?;
+
+        if let Some(increment) = increment {
+            body = Stmt::Block {
+                statements: vec![body, Stmt::Expression(increment)],
+            };
+        };
+
+        body = Stmt::While {
+            condition: condition.unwrap_or(Expr::Literal {
+                value: TokenLiteral::Bool(true),
+            }),
+            body: Box::new(body),
+        };
+
+        if let Some(initializer) = initializer {
+            body = Stmt::Block {
+                statements: vec![initializer, body],
+            };
+        }
+
+        Some(body)
+    }
+
+    fn if_statement(&mut self) -> Option<Stmt> {
+        self.consume(TokenType::LeftParen, "Expect '(' after 'if'.")?;
+        let condition = self.expression()?;
+        self.consume(TokenType::RightParen, "Expect ')' after if condition.")?;
+
+        let then_branch = self.statement()?;
+        let mut else_branch = None;
+        if self.match_one_of([TokenType::Else]) {
+            else_branch = Some(Box::from(self.statement()?));
+        }
+
+        Some(Stmt::If {
+            condition,
+            then_branch: Box::new(then_branch),
+            else_branch,
+        })
+    }
+
     fn print_statement(&mut self) -> Option<Stmt> {
         let expression = self.expression()?;
         self.consume(TokenType::Semicolon, "Expect ';' after value.")?;
         Some(Stmt::Print { expression })
+    }
+
+    fn while_statement(&mut self) -> Option<Stmt> {
+        self.consume(TokenType::LeftParen, "Expect '(' after 'while'.")?;
+        let condition = self.expression()?;
+        self.consume(TokenType::RightParen, "Expect ')' after condition.")?;
+        let body = self.statement()?;
+
+        Some(Stmt::While {
+            condition,
+            body: Box::from(body),
+        })
     }
 
     fn expression_statement(&mut self) -> Option<Stmt> {
@@ -918,6 +1042,22 @@ impl Interpreter {
 
                 return ret;
             }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                if is_truthy(&self.evaluate(condition)?) {
+                    self.execute(then_branch)?;
+                } else if let Some(else_branch) = else_branch {
+                    self.execute(else_branch)?;
+                }
+            }
+            Stmt::While { condition, body } => {
+                while is_truthy(&self.evaluate(condition)?) {
+                    self.execute(body)?;
+                }
+            }
             _ => panic!("Statement node is not supported yet."),
         }
         Ok(())
@@ -1012,6 +1152,25 @@ impl Interpreter {
                 let value = self.evaluate(&value).map(|value| value.clone());
                 self.environment.assign(&name, value.clone()?)?;
                 value
+            }
+            Expr::Logical {
+                left,
+                operator,
+                right,
+            } => {
+                let left = self.evaluate(&left)?;
+
+                if operator.token_type == TokenType::Or {
+                    if is_truthy(&left) {
+                        return Ok(left);
+                    }
+                } else {
+                    if !is_truthy(&left) {
+                        return Ok(left);
+                    }
+                }
+
+                self.evaluate(right)
             }
             _ => panic!("Expression node is not supported yet."),
         }
