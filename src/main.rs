@@ -58,7 +58,6 @@ impl App {
     fn run_file(&mut self, interpreter: &mut Interpreter, path: &str) {
         match fs::read_to_string(path) {
             Ok(content) => {
-                println!("{}", content.len());
                 self.run(interpreter, &content);
                 if self.had_error {
                     std::process::exit(65);
@@ -870,7 +869,7 @@ struct Interpreter {
 impl Interpreter {
     fn new() -> Interpreter {
         Interpreter {
-            environment: Environment::new(None),
+            environment: Environment::new(),
         }
     }
 
@@ -903,8 +902,9 @@ impl Interpreter {
                 self.environment.define(name.lexeme.clone(), value.clone());
             }
             Stmt::Block { statements } => {
-                let previous = self.environment.clone();
-                self.environment = Environment::new(Some(self.environment.clone()));
+                let mut old_environment = Environment::new();
+                std::mem::swap(&mut self.environment, &mut old_environment);
+                self.environment.enclosing = Some(Box::from(old_environment));
 
                 let mut ret = Ok(());
                 for statement in statements {
@@ -914,7 +914,7 @@ impl Interpreter {
                     }
                 }
 
-                self.environment = previous;
+                self.environment = *self.environment.enclosing.take().unwrap();
 
                 return ret;
             }
@@ -1075,10 +1075,10 @@ struct Environment {
 }
 
 impl Environment {
-    fn new(enclosing: Option<Environment>) -> Environment {
+    fn new() -> Environment {
         Environment {
             values: HashMap::new(),
-            enclosing: enclosing.map(|env| Box::from(env)),
+            enclosing: None,
         }
     }
 
