@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::rc::Rc;
 use std::str::FromStr;
-use std::{env, fs, io, str};
+use std::{env, fs, io, str, time};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -141,7 +143,7 @@ impl Scanner<'_> {
 
         self.tokens.push(Token {
             token_type: TokenType::Eof,
-            lexeme: "".to_string(),
+            lexeme: String::from(""),
             literal: TokenLiteral::Nil,
             line: self.line,
         });
@@ -296,7 +298,7 @@ impl Scanner<'_> {
         let value = &self.source[(self.start + 1)..(self.current - 1)];
         self.add_token_with_literal(
             TokenType::String,
-            TokenLiteral::String(str::from_utf8(value).unwrap().to_string()),
+            TokenLiteral::String(String::from(str::from_utf8(value).unwrap())),
         );
     }
 
@@ -413,7 +415,7 @@ fn is_digit(c: u8) -> bool {
     (b'0'..=b'9').contains(&c)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Expr {
     Assign {
         name: Token,
@@ -474,17 +476,19 @@ enum Expr {
     Variable(ExprVariable),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ExprVariable {
     name: Token,
 }
 
+#[derive(Clone)]
 struct StmtFunction {
     name: Token,
     params: Vec<Token>,
     body: Vec<Stmt>,
 }
 
+#[derive(Clone)]
 enum Stmt {
     Block {
         statements: Vec<Stmt>,
@@ -512,7 +516,7 @@ enum Stmt {
 
     Return {
         keyword: Token,
-        value: Expr,
+        value: Option<Expr>,
     },
 
     Var {
@@ -689,8 +693,51 @@ impl Parser<'_> {
                 right: Box::new(right),
             })
         } else {
-            self.primary()
+            self.call()
         }
+    }
+
+    fn call(&mut self) -> Option<Expr> {
+        let mut expr = self.primary();
+
+        expr.as_ref()?;
+
+        loop {
+            if self.match_one_of([TokenType::LeftParen]) {
+                expr = self.finish_call(expr?);
+            } else {
+                break;
+            }
+        }
+
+        expr
+    }
+
+    fn finish_call(&mut self, callee: Expr) -> Option<Expr> {
+        let mut arguments = Vec::new();
+
+        if !self.check_token(TokenType::RightParen) {
+            loop {
+                if arguments.len() >= 255 {
+                    self.app.error_token(
+                        &self.peek_token().clone(),
+                        "Can't have more than 255 arguments.",
+                    );
+                }
+                arguments.push(self.expression()?);
+                if !self.match_one_of([TokenType::Comma]) {
+                    break;
+                }
+            }
+        }
+
+        let paren = self.consume(TokenType::RightParen, "Expect ')' after arguments.")?;
+
+        Some(Expr::Call {
+            callee: Box::new(callee),
+            paren,
+            arguments,
+        })
     }
 
     fn primary(&mut self) -> Option<Expr> {
@@ -746,6 +793,8 @@ impl Parser<'_> {
             self.if_statement()
         } else if self.match_one_of([TokenType::Print]) {
             self.print_statement()
+        } else if self.match_one_of([TokenType::Return]) {
+            self.return_statement()
         } else if self.match_one_of([TokenType::While]) {
             self.while_statement()
         } else if self.match_one_of([TokenType::LeftBrace]) {
@@ -844,6 +893,18 @@ impl Parser<'_> {
         Some(Stmt::Print { expression })
     }
 
+    fn return_statement(&mut self) -> Option<Stmt> {
+        let keyword = self.previous_token().clone();
+        let mut value = None;
+        if !self.check_token(TokenType::Semicolon) {
+            value = Some(self.expression()?);
+        }
+
+        self.consume(TokenType::Semicolon, "Expect ';' after return value.")?;
+
+        Some(Stmt::Return { keyword, value })
+    }
+
     fn while_statement(&mut self) -> Option<Stmt> {
         self.consume(TokenType::LeftParen, "Expect '(' after 'while'.")?;
         let condition = self.expression()?;
@@ -863,7 +924,9 @@ impl Parser<'_> {
     }
 
     fn declaration(&mut self) -> Option<Stmt> {
-        if self.match_one_of([TokenType::Var]) {
+        if self.match_one_of([TokenType::Fun]) {
+            self.function("function")
+        } else if self.match_one_of([TokenType::Var]) {
             self.var_declaration()
         } else {
             match self.statement() {
@@ -874,6 +937,44 @@ impl Parser<'_> {
                 }
             }
         }
+    }
+
+    fn function(&mut self, kind: &str) -> Option<Stmt> {
+        let name = self.consume(TokenType::Identifier, &format!("Expect {} name.", kind))?;
+
+        self.consume(
+            TokenType::LeftParen,
+            &format!("Expect '(' after {} name.", kind),
+        )?;
+
+        let mut params = Vec::new();
+        if !self.check_token(TokenType::RightParen) {
+            loop {
+                if params.len() >= 255 {
+                    self.app.error_token(
+                        &self.peek_token().clone(),
+                        "Can't have more than 255 parameters.",
+                    );
+                }
+
+                params.push(self.consume(TokenType::Identifier, "Expect parameter name.")?);
+
+                if !self.match_one_of([TokenType::Comma]) {
+                    break;
+                }
+            }
+        }
+
+        self.consume(TokenType::RightParen, "Expect ')' after parameters.")?;
+
+        self.consume(
+            TokenType::LeftBrace,
+            &format!("Expect '{{' before {} body.", kind),
+        )?;
+
+        let body = self.block()?;
+
+        Some(Stmt::Function(StmtFunction { name, params, body }))
     }
 
     fn var_declaration(&mut self) -> Option<Stmt> {
@@ -964,22 +1065,73 @@ impl Parser<'_> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 enum Value {
     String(String),
     Number(f64),
     Bool(bool),
+    Callable { arity: usize, function: Function },
     Nil,
 }
 
+#[derive(Clone)]
+enum Function {
+    Native(fn(&mut Interpreter, &[Value]) -> Result<Value, ErrCause>),
+    Declared(StmtFunction, Rc<RefCell<Environment>>),
+}
+
+impl Function {
+    fn call(&self, interpreter: &mut Interpreter, arguments: &[Value]) -> Result<Value, ErrCause> {
+        match self {
+            Function::Native(function) => function(interpreter, arguments),
+            Function::Declared(StmtFunction { params, body, .. }, closure) => {
+                let mut environment = Environment::new(Some(Rc::clone(closure)));
+
+                for i in 0..params.len() {
+                    environment.define(params[i].lexeme.clone(), arguments[i].clone())
+                }
+
+                interpreter
+                    .execute_block(body, environment)
+                    .map(|_| Value::Nil)
+            }
+        }
+    }
+}
+
 struct Interpreter {
-    environment: Environment,
+    global_environment: Rc<RefCell<Environment>>,
+    environment: Rc<RefCell<Environment>>,
+}
+
+enum ErrCause {
+    Error(Token, String),
+    Return(Value),
 }
 
 impl Interpreter {
     fn new() -> Interpreter {
+        let global_environment = Rc::new(RefCell::new(Environment::new(None)));
+
+        (*global_environment).borrow_mut().define(
+            String::from("clock"),
+            Value::Callable {
+                arity: 0,
+                function: Function::Native(|_, _| {
+                    if let Ok(n) = time::SystemTime::now().duration_since(time::UNIX_EPOCH) {
+                        Ok(Value::Number(n.as_secs() as f64))
+                    } else {
+                        panic!("SystemTime before UNXI_EPOCH.");
+                    }
+                }),
+            },
+        );
+
+        let environment = Rc::clone(&global_environment);
+
         Interpreter {
-            environment: Environment::new(),
+            global_environment,
+            environment,
         }
     }
 
@@ -987,15 +1139,16 @@ impl Interpreter {
         for statement in statements {
             match self.execute(statement) {
                 Ok(_) => {}
-                Err((token, message)) => {
+                Err(ErrCause::Error(token, message)) => {
                     app.runtime_error(&token, &message);
                     break;
                 }
+                Err(ErrCause::Return(_)) => panic!("Unexpected top level return."),
             }
         }
     }
 
-    fn execute(&mut self, statement: &Stmt) -> Result<(), (Token, String)> {
+    fn execute(&mut self, statement: &Stmt) -> Result<(), ErrCause> {
         match statement {
             Stmt::Expression(expr) => {
                 self.evaluate(expr)?;
@@ -1009,24 +1162,13 @@ impl Interpreter {
                     Some(expr) => self.evaluate(expr)?,
                     _ => Value::Nil,
                 };
-                self.environment.define(name.lexeme.clone(), value);
+                (*self.environment)
+                    .borrow_mut()
+                    .define(name.lexeme.clone(), value);
             }
             Stmt::Block { statements } => {
-                let mut old_environment = Environment::new();
-                std::mem::swap(&mut self.environment, &mut old_environment);
-                self.environment.enclosing = Some(Box::from(old_environment));
-
-                let mut ret = Ok(());
-                for statement in statements {
-                    ret = self.execute(statement);
-                    if ret.is_err() {
-                        break;
-                    }
-                }
-
-                self.environment = *self.environment.enclosing.take().unwrap();
-
-                return ret;
+                let environment = Environment::new(Some(Rc::clone(&self.environment)));
+                self.execute_block(statements, environment)?;
             }
             Stmt::If {
                 condition,
@@ -1044,12 +1186,54 @@ impl Interpreter {
                     self.execute(body)?;
                 }
             }
+            Stmt::Function(function_stmt) => {
+                let function = Value::Callable {
+                    arity: function_stmt.params.len(),
+                    function: Function::Declared(
+                        function_stmt.clone(),
+                        Rc::clone(&self.environment),
+                    ),
+                };
+
+                (*self.environment)
+                    .borrow_mut()
+                    .define(function_stmt.name.lexeme.clone(), function);
+            }
+            Stmt::Return { value, .. } => {
+                let return_value = match value {
+                    Some(value_expr) => self.evaluate(value_expr)?,
+                    None => Value::Nil,
+                };
+
+                return Err(ErrCause::Return(return_value));
+            }
             _ => panic!("Statement node is not supported yet."),
         }
         Ok(())
     }
 
-    fn evaluate(&mut self, expr: &Expr) -> Result<Value, (Token, String)> {
+    fn execute_block(
+        &mut self,
+        statements: &[Stmt],
+        environment: Environment,
+    ) -> Result<(), ErrCause> {
+        let previous = Rc::clone(&self.environment);
+        self.environment = Rc::new(RefCell::new(environment));
+
+        let mut ret = Ok(());
+        for statement in statements {
+            ret = self.execute(statement);
+            if ret.is_err() {
+                break;
+            }
+        }
+
+        self.environment = previous;
+
+        ret
+    }
+
+    fn evaluate(&mut self, expr: &Expr) -> Result<Value, ErrCause> {
         match expr {
             Expr::Binary {
                 left,
@@ -1082,9 +1266,9 @@ impl Interpreter {
                         (Value::String(left_str), Value::String(right_str)) => {
                             Ok(Value::String(left_str + &right_str))
                         }
-                        _ => Err((
+                        _ => Err(ErrCause::Error(
                             operator.clone(),
-                            "Operands must be two numbers or two strings.".to_string(),
+                            String::from("Operands must be two numbers or two strings."),
                         )),
                     },
                     TokenType::Greater => {
@@ -1131,13 +1315,13 @@ impl Interpreter {
                     _ => panic!("Unexpected unary operator token."),
                 }
             }
-            Expr::Variable(ExprVariable { name }) => {
-                self.environment.get(name).map(|value| value.clone())
-            }
+            Expr::Variable(ExprVariable { name }) => (*self.environment).borrow_mut().get(name),
             Expr::Assign { name, value } => {
-                let value = self.evaluate(value);
-                self.environment.assign(name, value.clone()?)?;
-                value
+                let value = self.evaluate(value)?;
+                (*self.environment)
+                    .borrow_mut()
+                    .assign(name, value.clone())?;
+                Ok(value)
             }
             Expr::Logical {
                 left,
@@ -1156,18 +1340,50 @@ impl Interpreter {
 
                 self.evaluate(right)
             }
+            Expr::Call {
+                callee,
+                paren,
+                arguments,
+            } => {
+                let callee = self.evaluate(callee)?;
+
+                let mut argument_values = Vec::new();
+                for argument in arguments {
+                    argument_values.push(self.evaluate(argument)?);
+                }
+
+                if let Value::Callable { arity, function } = callee {
+                    if argument_values.len() == arity {
+                        match function.call(self, &argument_values) {
+                            Err(ErrCause::Return(value)) => Ok(value),
+                            result => result,
+                        }
+                    } else {
+                        let message = format!(
+                            "Expected {} arguments but got {} .",
+                            arity,
+                            argument_values.len()
+                        );
+                        Err(ErrCause::Error(paren.clone(), message))
+                    }
+                } else {
+                    Err(ErrCause::Error(
+                        paren.clone(),
+                        String::from("Can only call functions and classes."),
+                    ))
+                }
+            }
             _ => panic!("Expression node is not supported yet."),
         }
     }
 
-    fn check_number_operand(
-        &mut self,
-        operator: &Token,
-        operand: &Value,
-    ) -> Result<f64, (Token, String)> {
+    fn check_number_operand(&mut self, operator: &Token, operand: &Value) -> Result<f64, ErrCause> {
         match operand {
             Value::Number(num) => Ok(*num),
-            _ => Err((operator.clone(), String::from("Operand must be a number."))),
+            _ => Err(ErrCause::Error(
+                operator.clone(),
+                String::from("Operand must be a number."),
+            )),
         }
     }
 
@@ -1176,10 +1392,13 @@ impl Interpreter {
         operator: &Token,
         left: &Value,
         right: &Value,
-    ) -> Result<(f64, f64), (Token, String)> {
+    ) -> Result<(f64, f64), ErrCause> {
         match (left, right) {
             (Value::Number(left_num), Value::Number(right_num)) => Ok((*left_num, *right_num)),
-            _ => Err((operator.clone(), String::from("Operands must be a number."))),
+            _ => Err(ErrCause::Error(
+                operator.clone(),
+                String::from("Operands must be a number."),
+            )),
         }
     }
 }
@@ -1193,7 +1412,13 @@ fn is_truthy(value: &Value) -> bool {
 }
 
 fn is_equal(left: &Value, right: &Value) -> bool {
-    left == right
+    match (left, right) {
+        (Value::String(l), Value::String(r)) => l == r,
+        (Value::Number(l), Value::Number(r)) => l == r,
+        (Value::Bool(l), Value::Bool(r)) => l == r,
+        (Value::Nil, Value::Nil) => true,
+        (_, _) => false,
+    }
 }
 
 fn stringify(value: &Value) -> String {
@@ -1208,20 +1433,24 @@ fn stringify(value: &Value) -> String {
             }
         }
         Value::Nil => String::from("nil"),
+        Value::Callable { function, .. } => match function {
+            Function::Native(_) => String::from("<native fn>"),
+            Function::Declared(StmtFunction { name, .. }, _) => format!("<fn {}>", name.lexeme),
+        },
     }
 }
 
 #[derive(Clone)]
 struct Environment {
     values: HashMap<String, Value>,
-    enclosing: Option<Box<Environment>>,
+    enclosing: Option<Rc<RefCell<Environment>>>,
 }
 
 impl Environment {
-    fn new() -> Environment {
+    fn new(enclosing: Option<Rc<RefCell<Environment>>>) -> Environment {
         Environment {
             values: HashMap::new(),
-            enclosing: None,
+            enclosing,
         }
     }
 
@@ -1229,31 +1458,31 @@ impl Environment {
         self.values.insert(name, value);
     }
 
-    fn assign(&mut self, name: &Token, value: Value) -> Result<(), (Token, String)> {
+    fn assign(&mut self, name: &Token, value: Value) -> Result<(), ErrCause> {
         match self.values.get(&name.lexeme) {
             Some(_) => {
                 self.values.insert(name.lexeme.clone(), value);
                 Ok(())
             }
             None => self.enclosing.as_mut().map_or(
-                Err((
+                Err(ErrCause::Error(
                     name.clone(),
                     format!("Undefined variable '{}'.", name.lexeme),
                 )),
-                |enclosing| enclosing.assign(name, value),
+                |enclosing| (**enclosing).borrow_mut().assign(name, value),
             ),
         }
     }
 
-    fn get(&mut self, name: &Token) -> Result<&Value, (Token, String)> {
+    fn get(&mut self, name: &Token) -> Result<Value, ErrCause> {
         match self.values.get(&name.lexeme) {
-            Some(value) => Ok(value),
+            Some(value) => Ok(value.clone()),
             None => self.enclosing.as_mut().map_or(
-                Err((
+                Err(ErrCause::Error(
                     name.clone(),
                     format!("Undefined variable '{}'.", name.lexeme),
                 )),
-                |enclosing| enclosing.get(name),
+                |enclosing| (**enclosing).borrow_mut().get(name),
             ),
         }
     }
