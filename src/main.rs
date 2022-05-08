@@ -108,6 +108,13 @@ impl App {
             return;
         }
 
+        let mut resolver = Resolver::new(interpreter);
+        resolver.resolve(&statements);
+
+        if self.had_error {
+            return;
+        }
+
         interpreter.interpret(self, &statements);
     }
 }
@@ -420,6 +427,7 @@ enum Expr {
     Assign {
         name: Token,
         value: Box<Expr>,
+        id: ExprId,
     },
 
     Binary {
@@ -473,8 +481,11 @@ enum Expr {
         right: Box<Expr>,
     },
 
-    Variable(ExprVariable),
+    Variable(ExprId, ExprVariable),
 }
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+struct ExprId(u64);
 
 #[derive(Clone, Debug)]
 struct ExprVariable {
@@ -534,6 +545,7 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     current: usize,
     app: &'a mut App,
+    expr_id_count: u64,
 }
 
 impl Parser<'_> {
@@ -542,6 +554,7 @@ impl Parser<'_> {
             tokens,
             current: 0,
             app,
+            expr_id_count: 0,
         }
     }
 
@@ -557,9 +570,10 @@ impl Parser<'_> {
             let equals = self.previous_token().clone();
 
             return match expr {
-                Expr::Variable(ExprVariable { name }) => Some(Expr::Assign {
+                Expr::Variable(_, ExprVariable { name }) => Some(Expr::Assign {
                     name,
                     value: Box::from(value),
+                    id: self.gen_expr_id(),
                 }),
                 _ => {
                     self.app.error_token(&equals, "Invalid assignment target.");
@@ -758,9 +772,12 @@ impl Parser<'_> {
                 value: self.previous_token().literal.clone(),
             })
         } else if self.match_one_of([TokenType::Identifier]) {
-            Some(Expr::Variable(ExprVariable {
-                name: self.previous_token().clone(),
-            }))
+            Some(Expr::Variable(
+                self.gen_expr_id(),
+                ExprVariable {
+                    name: self.previous_token().clone(),
+                },
+            ))
         } else if self.match_one_of([TokenType::LeftParen]) {
             let expr = self.expression()?;
             self.consume(TokenType::RightParen, "Expect ')' after expression.")?;
@@ -772,6 +789,12 @@ impl Parser<'_> {
                 .error_token(&self.peek_token().clone(), "Expect expression.");
             None
         }
+    }
+
+    fn gen_expr_id(&mut self) -> ExprId {
+        let id = ExprId(self.expr_id_count);
+        self.expr_id_count += 1;
+        return id;
     }
 
     fn parse(&mut self) -> Vec<Stmt> {
@@ -1102,6 +1125,7 @@ impl Function {
 struct Interpreter {
     global_environment: Rc<RefCell<Environment>>,
     environment: Rc<RefCell<Environment>>,
+    locals: HashMap<ExprId, usize>,
 }
 
 enum ErrCause {
@@ -1132,6 +1156,7 @@ impl Interpreter {
         Interpreter {
             global_environment,
             environment,
+            locals: HashMap::new(),
         }
     }
 
@@ -1315,12 +1340,13 @@ impl Interpreter {
                     _ => panic!("Unexpected unary operator token."),
                 }
             }
-            Expr::Variable(ExprVariable { name }) => (*self.environment).borrow_mut().get(name),
-            Expr::Assign { name, value } => {
+            Expr::Variable(id, ExprVariable { name }) => self.look_up_variable(name, *id),
+            Expr::Assign { name, value, id } => {
                 let value = self.evaluate(value)?;
-                (*self.environment)
-                    .borrow_mut()
-                    .assign(name, value.clone())?;
+                let distance = self.locals.get(id);
+                if let Some(distance) = distance {
+                    Environment::assign_at(&self.environment, *distance, &name, value.clone());
+                }
                 Ok(value)
             }
             Expr::Logical {
@@ -1374,6 +1400,19 @@ impl Interpreter {
                 }
             }
             _ => panic!("Expression node is not supported yet."),
+        }
+    }
+
+    fn resolve(&mut self, id: ExprId, depth: usize) {
+        self.locals.insert(id, depth);
+    }
+
+    fn look_up_variable(&mut self, name: &Token, id: ExprId) -> Result<Value, ErrCause> {
+        let distance = self.locals.get(&id);
+        if let Some(distance) = distance {
+            Environment::get_at(&self.environment, *distance, &name)
+        } else {
+            (*self.global_environment).borrow_mut().get(name)
         }
     }
 
@@ -1485,5 +1524,195 @@ impl Environment {
                 |enclosing| (**enclosing).borrow_mut().get(name),
             ),
         }
+    }
+
+    fn get_at(
+        environment: &Rc<RefCell<Environment>>,
+        distance: usize,
+        name: &Token,
+    ) -> Result<Value, ErrCause> {
+        (*Environment::ancestor(environment, distance))
+            .borrow_mut()
+            .get(name)
+    }
+
+    fn assign_at(
+        environment: &Rc<RefCell<Environment>>,
+        distance: usize,
+        name: &Token,
+        value: Value,
+    ) -> Result<(), ErrCause> {
+        (*Environment::ancestor(environment, distance))
+            .borrow_mut()
+            .assign(name, value)
+    }
+
+    fn ancestor(
+        environment: &Rc<RefCell<Environment>>,
+        distance: usize,
+    ) -> Rc<RefCell<Environment>> {
+        let mut env = Rc::clone(environment);
+        for _ in 0..distance {
+            let enclosing = Rc::clone(env.borrow().enclosing.as_ref().unwrap());
+            env = enclosing;
+        }
+        env
+    }
+}
+
+struct Resolver<'a> {
+    interpreter: &'a mut Interpreter,
+    scopes: Vec<HashMap<String, bool>>,
+    current_function: FunctionType,
+}
+
+#[derive(Copy, Clone)]
+enum FunctionType {
+    None,
+    Function,
+}
+
+impl Resolver<'_> {
+    fn new(interpreter: &mut Interpreter) -> Resolver {
+        Resolver {
+            interpreter,
+            scopes: Vec::new(),
+            current_function: FunctionType::None,
+        }
+    }
+
+    fn resolve(&mut self, statements: &[Stmt]) {
+        for stmt in statements {
+            self.resolve_stmt(stmt)
+        }
+    }
+
+    fn resolve_stmt(&mut self, statement: &Stmt) {
+        match statement {
+            Stmt::Block { statements } => {
+                self.begin_scope();
+                self.resolve(statements);
+                self.end_scope();
+            }
+            Stmt::Expression(expr) => self.resolve_expr(expr),
+            Stmt::Function(StmtFunction { name, params, body }) => {
+                self.declare(name);
+                self.define(name);
+
+                let enclosing_function = self.current_function;
+                self.current_function = FunctionType::Function;
+
+                self.begin_scope();
+                for param in params {
+                    self.declare(param);
+                    self.define(param);
+                }
+                self.resolve(body);
+                self.end_scope();
+
+                self.current_function = enclosing_function;
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.resolve_expr(condition);
+                self.resolve_stmt(then_branch);
+                else_branch.as_ref().map(|stmt| self.resolve_stmt(stmt));
+            }
+            Stmt::Print { expression } => self.resolve_expr(expression),
+            Stmt::Return { value, .. } => {
+                // TODO: if (currentFunction == FunctionType.None) {
+                //         Lox.error(stmt.keyword, "Can't return from top-level code.");
+                //       }
+
+                value.as_ref().map(|expr| self.resolve_expr(expr));
+            }
+            Stmt::Var { name, initializer } => {
+                self.declare(name);
+                if let Some(initializer) = initializer {
+                    self.resolve_expr(initializer);
+                }
+                self.define(name);
+            }
+            Stmt::While { condition, body } => {
+                self.resolve_expr(condition);
+                self.resolve_stmt(body);
+            }
+            _ => panic!("Statement node is not supported yet."),
+        }
+    }
+
+    fn resolve_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Assign { name, value, id } => {
+                self.resolve_expr(value);
+                self.resolve_local(*id, &name);
+            }
+            Expr::Binary { left, right, .. } => {
+                self.resolve_expr(left);
+                self.resolve_expr(right);
+            }
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                self.resolve_expr(callee);
+                for argument in arguments {
+                    self.resolve_expr(argument);
+                }
+            }
+            Expr::Grouping { expression } => self.resolve_expr(expression),
+            Expr::Literal { .. } => {}
+            Expr::Logical { left, right, .. } => {
+                self.resolve_expr(left);
+                self.resolve_expr(right);
+            }
+            Expr::Unary { right, .. } => self.resolve_expr(right),
+            Expr::Variable(id, ExprVariable { name }) => {
+                if let Some(scope) = self.scopes.last() {
+                    if let Some(defined) = scope.get(&name.lexeme) {
+                        if !defined {
+                            // TODO: Lox.error(expr.name, "Can't read local variable in its own initializer.");
+                            return;
+                        }
+                    }
+                }
+                self.resolve_local(*id, name);
+            }
+            _ => panic!("Expression node is not supported yet."),
+        }
+    }
+
+    fn resolve_local(&mut self, id: ExprId, name: &Token) {
+        for i in (0..self.scopes.len()).rev() {
+            if self.scopes[i].contains_key(&name.lexeme) {
+                self.interpreter.resolve(id, self.scopes.len() - 1 - i);
+                return;
+            }
+        }
+    }
+
+    fn declare(&mut self, name: &Token) {
+        if let Some(scope) = self.scopes.last_mut() {
+            // TODO: if (scope.containsKey(name.lexeme)) {
+            //         Lox.error(name, "Already a variable with this name in this scope.");
+            //       }
+            scope.insert(name.lexeme.clone(), false);
+        }
+    }
+
+    fn define(&mut self, name: &Token) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.lexeme.clone(), true);
+        }
+    }
+
+    fn begin_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn end_scope(&mut self) {
+        self.scopes.pop();
     }
 }
