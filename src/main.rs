@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
@@ -8,7 +8,7 @@ use std::{env, fs, io, str, time};
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let mut app = App::new();
+    let app = App::new();
     let mut interpreter = Interpreter::new();
 
     match &args[..] {
@@ -22,23 +22,23 @@ fn main() {
 }
 
 struct App {
-    had_error: bool,
-    had_runtime_error: bool,
+    had_error: Cell<bool>,
+    had_runtime_error: Cell<bool>,
 }
 
 impl App {
     fn new() -> App {
         App {
-            had_error: false,
-            had_runtime_error: false,
+            had_error: Cell::new(false),
+            had_runtime_error: Cell::new(false),
         }
     }
 
-    fn error(&mut self, line: u64, message: &str) {
+    fn error(&self, line: u64, message: &str) {
         self.report(line, "", message);
     }
 
-    fn error_token(&mut self, token: &Token, message: &str) {
+    fn error_token(&self, token: &Token, message: &str) {
         if token.token_type == TokenType::Eof {
             self.report(token.line, " at end", message);
         } else {
@@ -46,21 +46,21 @@ impl App {
         }
     }
 
-    fn runtime_error(&mut self, token: &Token, message: &str) {
-        self.had_runtime_error = true;
+    fn runtime_error(&self, token: &Token, message: &str) {
+        self.had_runtime_error.set(true);
         eprintln!("{}\n[line {}]", message, token.line);
     }
 
-    fn report(&mut self, line: u64, origin: &str, message: &str) {
-        self.had_error = true;
+    fn report(&self, line: u64, origin: &str, message: &str) {
+        self.had_error.set(true);
         eprintln!("[line {}] Error{}: {}", line, origin, message);
     }
 
-    fn run_file(&mut self, interpreter: &mut Interpreter, path: &str) {
+    fn run_file(&self, interpreter: &mut Interpreter, path: &str) {
         match fs::read_to_string(path) {
             Ok(content) => {
                 self.run(interpreter, &content);
-                if self.had_error {
+                if self.had_error.get() {
                     std::process::exit(65);
                 }
             }
@@ -71,7 +71,7 @@ impl App {
         }
     }
 
-    fn run_prompt(&mut self, interpreter: &mut Interpreter) {
+    fn run_prompt(&self, interpreter: &mut Interpreter) {
         let mut line = String::with_capacity(1024);
         let stdin = io::stdin();
         let mut handle = stdin.lock();
@@ -88,7 +88,7 @@ impl App {
                         std::process::exit(0);
                     }
                     self.run(interpreter, &line);
-                    self.had_error = false;
+                    self.had_error.set(false);
                 }
                 Err(error) => {
                     println!("Error: {}", error);
@@ -98,20 +98,20 @@ impl App {
         }
     }
 
-    fn run(&mut self, interpreter: &mut Interpreter, source: &str) {
+    fn run(&self, interpreter: &mut Interpreter, source: &str) {
         let mut scanner = Scanner::new(self, source.as_bytes());
         let tokens = scanner.scan_tokens();
         let mut parser = Parser::new(self, tokens);
         let statements = parser.parse();
 
-        if self.had_error {
+        if self.had_error.get() {
             return;
         }
 
-        let mut resolver = Resolver::new(interpreter);
+        let mut resolver = Resolver::new(self, interpreter);
         resolver.resolve(&statements);
 
-        if self.had_error {
+        if self.had_error.get() {
             return;
         }
 
@@ -125,11 +125,11 @@ struct Scanner<'a> {
     start: usize,
     current: usize,
     tokens: Vec<Token>,
-    app: &'a mut App,
+    app: &'a App,
 }
 
 impl Scanner<'_> {
-    fn new<'a>(app: &'a mut App, source: &'a [u8]) -> Scanner<'a> {
+    fn new<'a>(app: &'a App, source: &'a [u8]) -> Scanner<'a> {
         Scanner {
             source,
             line: 1,
@@ -544,12 +544,12 @@ enum Stmt {
 struct Parser<'a> {
     tokens: Vec<Token>,
     current: usize,
-    app: &'a mut App,
+    app: &'a App,
     expr_id_count: u64,
 }
 
 impl Parser<'_> {
-    fn new(app: &mut App, tokens: Vec<Token>) -> Parser {
+    fn new(app: &App, tokens: Vec<Token>) -> Parser {
         Parser {
             tokens,
             current: 0,
@@ -1160,7 +1160,7 @@ impl Interpreter {
         }
     }
 
-    fn interpret(&mut self, app: &mut App, statements: &[Stmt]) {
+    fn interpret(&mut self, app: &App, statements: &[Stmt]) {
         for statement in statements {
             match self.execute(statement) {
                 Ok(_) => {}
@@ -1561,20 +1561,22 @@ impl Environment {
 }
 
 struct Resolver<'a> {
+    app: &'a App,
     interpreter: &'a mut Interpreter,
     scopes: Vec<HashMap<String, bool>>,
     current_function: FunctionType,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 enum FunctionType {
     None,
     Function,
 }
 
 impl Resolver<'_> {
-    fn new(interpreter: &mut Interpreter) -> Resolver {
+    fn new<'a>(app: &'a App, interpreter: &'a mut Interpreter) -> Resolver<'a> {
         Resolver {
+            app,
             interpreter,
             scopes: Vec::new(),
             current_function: FunctionType::None,
@@ -1622,10 +1624,11 @@ impl Resolver<'_> {
                 else_branch.as_ref().map(|stmt| self.resolve_stmt(stmt));
             }
             Stmt::Print { expression } => self.resolve_expr(expression),
-            Stmt::Return { value, .. } => {
-                // TODO: if (currentFunction == FunctionType.None) {
-                //         Lox.error(stmt.keyword, "Can't return from top-level code.");
-                //       }
+            Stmt::Return { keyword, value } => {
+                if self.current_function == FunctionType::None {
+                    self.app
+                        .error_token(keyword, "Can't return from top-level code.")
+                }
 
                 value.as_ref().map(|expr| self.resolve_expr(expr));
             }
@@ -1673,8 +1676,10 @@ impl Resolver<'_> {
                 if let Some(scope) = self.scopes.last() {
                     if let Some(defined) = scope.get(&name.lexeme) {
                         if !defined {
-                            // TODO: Lox.error(expr.name, "Can't read local variable in its own initializer.");
-                            return;
+                            self.app.error_token(
+                                name,
+                                "Can't read local variable in its own initializer.",
+                            );
                         }
                     }
                 }
@@ -1695,9 +1700,10 @@ impl Resolver<'_> {
 
     fn declare(&mut self, name: &Token) {
         if let Some(scope) = self.scopes.last_mut() {
-            // TODO: if (scope.containsKey(name.lexeme)) {
-            //         Lox.error(name, "Already a variable with this name in this scope.");
-            //       }
+            if scope.contains_key(&name.lexeme) {
+                self.app
+                    .error_token(name, "Already a variable with this name in in this scope.")
+            }
             scope.insert(name.lexeme.clone(), false);
         }
     }
