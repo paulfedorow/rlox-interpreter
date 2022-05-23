@@ -474,6 +474,7 @@ enum Expr {
 
     This {
         keyword: Token,
+        id: ExprId,
     },
 
     Unary {
@@ -507,7 +508,7 @@ enum Stmt {
 
     Class {
         name: Token,
-        superclass: ExprVariable,
+        superclass: Option<ExprVariable>,
         methods: Vec<StmtFunction>,
     },
 
@@ -574,6 +575,11 @@ impl Parser<'_> {
                     name,
                     value: Box::from(value),
                     id: self.gen_expr_id(),
+                }),
+                Expr::Get { object, name } => Some(Expr::Set {
+                    object,
+                    name,
+                    value: Box::new(value),
                 }),
                 _ => {
                     self.app.error_token(&equals, "Invalid assignment target.");
@@ -719,6 +725,13 @@ impl Parser<'_> {
         loop {
             if self.match_one_of([TokenType::LeftParen]) {
                 expr = self.finish_call(expr?);
+            } else if self.match_one_of([TokenType::Dot]) {
+                let name =
+                    self.consume(TokenType::Identifier, "Expect property name after '.'.")?;
+                expr = Some(Expr::Get {
+                    object: Box::new(expr?.clone()),
+                    name,
+                })
             } else {
                 break;
             }
@@ -778,6 +791,11 @@ impl Parser<'_> {
                     name: self.previous_token().clone(),
                 },
             ))
+        } else if self.match_one_of([TokenType::This]) {
+            Some(Expr::This {
+                keyword: self.previous_token().clone(),
+                id: self.gen_expr_id(),
+            })
         } else if self.match_one_of([TokenType::LeftParen]) {
             let expr = self.expression()?;
             self.consume(TokenType::RightParen, "Expect ')' after expression.")?;
@@ -947,8 +965,10 @@ impl Parser<'_> {
     }
 
     fn declaration(&mut self) -> Option<Stmt> {
-        if self.match_one_of([TokenType::Fun]) {
-            self.function("function")
+        if self.match_one_of([TokenType::Class]) {
+            self.class_declaration()
+        } else if self.match_one_of([TokenType::Fun]) {
+            self.function("function").map(|f| Stmt::Function(f))
         } else if self.match_one_of([TokenType::Var]) {
             self.var_declaration()
         } else {
@@ -962,7 +982,25 @@ impl Parser<'_> {
         }
     }
 
-    fn function(&mut self, kind: &str) -> Option<Stmt> {
+    fn class_declaration(&mut self) -> Option<Stmt> {
+        let name = self.consume(TokenType::Identifier, "Expect class name")?;
+        self.consume(TokenType::LeftBrace, "Expect '{' before class body.")?;
+
+        let mut methods = Vec::new();
+        while !self.check_token(TokenType::RightBrace) && !self.is_at_end() {
+            methods.push(self.function("method")?);
+        }
+
+        self.consume(TokenType::RightBrace, "Expect '}' after class body.")?;
+
+        Some(Stmt::Class {
+            name,
+            superclass: None,
+            methods,
+        })
+    }
+
+    fn function(&mut self, kind: &str) -> Option<StmtFunction> {
         let name = self.consume(TokenType::Identifier, &format!("Expect {} name.", kind))?;
 
         self.consume(
@@ -997,7 +1035,7 @@ impl Parser<'_> {
 
         let body = self.block()?;
 
-        Some(Stmt::Function(StmtFunction { name, params, body }))
+        Some(StmtFunction { name, params, body })
     }
 
     fn var_declaration(&mut self) -> Option<Stmt> {
@@ -1094,30 +1132,62 @@ enum Value {
     Number(f64),
     Bool(bool),
     Callable { arity: usize, function: Function },
+    Instance(Instance),
     Nil,
 }
 
 #[derive(Clone)]
 enum Function {
     Native(fn(&mut Interpreter, &[Value]) -> Result<Value, ErrCause>),
-    Declared(StmtFunction, Rc<RefCell<Environment>>),
+    Declared(StmtFunction, Rc<RefCell<Environment>>, bool),
+    Class(Class),
 }
 
 impl Function {
     fn call(&self, interpreter: &mut Interpreter, arguments: &[Value]) -> Result<Value, ErrCause> {
         match self {
             Function::Native(function) => function(interpreter, arguments),
-            Function::Declared(StmtFunction { params, body, .. }, closure) => {
+            Function::Declared(StmtFunction { params, body, .. }, closure, is_initializer) => {
                 let mut environment = Environment::new(Some(Rc::clone(closure)));
 
                 for i in 0..params.len() {
                     environment.define(params[i].lexeme.clone(), arguments[i].clone())
                 }
 
-                interpreter
-                    .execute_block(body, environment)
-                    .map(|_| Value::Nil)
+                let result = interpreter.execute_block(body, environment);
+
+                if *is_initializer {
+                    return Ok(closure.borrow().values.get("this").unwrap().clone());
+                }
+
+                result.map(|_| Value::Nil)
             }
+            Function::Class(class) => {
+                let instance = Instance::new(class.clone());
+                if let Some(Value::Callable {
+                    function: initializer,
+                    ..
+                }) = instance.find_method("init")
+                {
+                    initializer.bind(&instance).call(interpreter, arguments);
+                }
+
+                Ok(Value::Instance(instance))
+            }
+        }
+    }
+
+    fn bind(&self, instance: &Instance) -> Function {
+        if let Function::Declared(stmt_function, closure, is_initializer) = self {
+            let mut environment = Environment::new(Some(Rc::clone(closure)));
+            environment.define(String::from("this"), Value::Instance(instance.clone()));
+            Function::Declared(
+                stmt_function.clone(),
+                Rc::new(RefCell::new(environment)),
+                *is_initializer,
+            )
+        } else {
+            unreachable!()
         }
     }
 }
@@ -1217,12 +1287,47 @@ impl Interpreter {
                     function: Function::Declared(
                         function_stmt.clone(),
                         Rc::clone(&self.environment),
+                        false,
                     ),
                 };
 
                 (*self.environment)
                     .borrow_mut()
                     .define(function_stmt.name.lexeme.clone(), function);
+            }
+            Stmt::Class { name, methods, .. } => {
+                (*self.environment)
+                    .borrow_mut()
+                    .define(name.lexeme.clone(), Value::Nil);
+
+                let mut initializer_arity = 0;
+                let mut class_methods = HashMap::new();
+                for method in methods {
+                    let is_initializer = method.name.lexeme == "init";
+                    if is_initializer {
+                        initializer_arity = method.params.len();
+                    }
+                    let function = Value::Callable {
+                        arity: method.params.len(),
+                        function: Function::Declared(
+                            method.clone(),
+                            Rc::clone(&self.environment),
+                            is_initializer,
+                        ),
+                    };
+                    class_methods.insert(method.name.lexeme.clone(), function);
+                }
+
+                (*self.environment).borrow_mut().assign(
+                    &name,
+                    Value::Callable {
+                        arity: initializer_arity,
+                        function: Function::Class(Class {
+                            name: name.lexeme.clone(),
+                            methods: class_methods,
+                        }),
+                    },
+                )?;
             }
             Stmt::Return { value, .. } => {
                 let return_value = match value {
@@ -1232,7 +1337,6 @@ impl Interpreter {
 
                 return Err(ErrCause::Return(return_value));
             }
-            _ => panic!("Statement node is not supported yet."),
         }
         Ok(())
     }
@@ -1345,7 +1449,7 @@ impl Interpreter {
                 let value = self.evaluate(value)?;
                 let distance = self.locals.get(id);
                 if let Some(distance) = distance {
-                    Environment::assign_at(&self.environment, *distance, &name, value.clone());
+                    Environment::assign_at(&self.environment, *distance, &name, value.clone())?;
                 }
                 Ok(value)
             }
@@ -1399,6 +1503,36 @@ impl Interpreter {
                     ))
                 }
             }
+            Expr::Get { object, name } => {
+                let object = self.evaluate(object)?;
+                if let Value::Instance(instance) = object {
+                    instance.get(name)
+                } else {
+                    Err(ErrCause::Error(
+                        name.clone(),
+                        String::from("Only instances have properties."),
+                    ))
+                }
+            }
+            Expr::Set {
+                object,
+                name,
+                value,
+            } => {
+                let mut object = self.evaluate(object)?;
+
+                if let Value::Instance(instance) = &mut object {
+                    let value = self.evaluate(value)?;
+                    instance.set(name, value.clone());
+                    Ok(value)
+                } else {
+                    Err(ErrCause::Error(
+                        name.clone(),
+                        String::from("Only instances have fields."),
+                    ))
+                }
+            }
+            Expr::This { keyword, id } => self.look_up_variable(keyword, *id),
             _ => panic!("Expression node is not supported yet."),
         }
     }
@@ -1410,7 +1544,11 @@ impl Interpreter {
     fn look_up_variable(&mut self, name: &Token, id: ExprId) -> Result<Value, ErrCause> {
         let distance = self.locals.get(&id);
         if let Some(distance) = distance {
-            Environment::get_at(&self.environment, *distance, &name)
+            Ok(Environment::get_at(
+                &self.environment,
+                *distance,
+                &name.lexeme,
+            ))
         } else {
             (*self.global_environment).borrow_mut().get(name)
         }
@@ -1462,7 +1600,7 @@ fn is_equal(left: &Value, right: &Value) -> bool {
 
 fn stringify(value: &Value) -> String {
     match value {
-        Value::String(str) => str.to_string(),
+        Value::String(str) => str.clone(),
         Value::Number(num) => format!("{}", num),
         Value::Bool(b) => {
             if *b {
@@ -1474,8 +1612,10 @@ fn stringify(value: &Value) -> String {
         Value::Nil => String::from("nil"),
         Value::Callable { function, .. } => match function {
             Function::Native(_) => String::from("<native fn>"),
-            Function::Declared(StmtFunction { name, .. }, _) => format!("<fn {}>", name.lexeme),
+            Function::Declared(StmtFunction { name, .. }, _, _) => format!("<fn {}>", name.lexeme),
+            Function::Class(Class { name, .. }) => name.clone(),
         },
+        Value::Instance(instance) => format!("{} instance", instance.name()),
     }
 }
 
@@ -1526,14 +1666,13 @@ impl Environment {
         }
     }
 
-    fn get_at(
-        environment: &Rc<RefCell<Environment>>,
-        distance: usize,
-        name: &Token,
-    ) -> Result<Value, ErrCause> {
+    fn get_at(environment: &Rc<RefCell<Environment>>, distance: usize, name: &str) -> Value {
         (*Environment::ancestor(environment, distance))
             .borrow_mut()
+            .values
             .get(name)
+            .unwrap()
+            .clone()
     }
 
     fn assign_at(
@@ -1565,12 +1704,21 @@ struct Resolver<'a> {
     interpreter: &'a mut Interpreter,
     scopes: Vec<HashMap<String, bool>>,
     current_function: FunctionType,
+    current_class: ClassType,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum FunctionType {
     None,
     Function,
+    Initializer,
+    Method,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ClassType {
+    None,
+    Class,
 }
 
 impl Resolver<'_> {
@@ -1580,6 +1728,7 @@ impl Resolver<'_> {
             interpreter,
             scopes: Vec::new(),
             current_function: FunctionType::None,
+            current_class: ClassType::None,
         }
     }
 
@@ -1597,22 +1746,35 @@ impl Resolver<'_> {
                 self.end_scope();
             }
             Stmt::Expression(expr) => self.resolve_expr(expr),
-            Stmt::Function(StmtFunction { name, params, body }) => {
+            Stmt::Function(function) => {
+                self.declare(&function.name);
+                self.define(&function.name);
+
+                self.resolve_function(&function, FunctionType::Function);
+            }
+            Stmt::Class { name, methods, .. } => {
+                let enclosing_class = self.current_class;
+                self.current_class = ClassType::Class;
+
                 self.declare(name);
                 self.define(name);
 
-                let enclosing_function = self.current_function;
-                self.current_function = FunctionType::Function;
-
                 self.begin_scope();
-                for param in params {
-                    self.declare(param);
-                    self.define(param);
+                let last = self.scopes.len() - 1;
+                self.scopes[last].insert(String::from("this"), true);
+
+                for method in methods {
+                    let declaration = if method.name.lexeme == "init" {
+                        FunctionType::Initializer
+                    } else {
+                        FunctionType::Method
+                    };
+                    self.resolve_function(&method, declaration);
                 }
-                self.resolve(body);
+
                 self.end_scope();
 
-                self.current_function = enclosing_function;
+                self.current_class = enclosing_class;
             }
             Stmt::If {
                 condition,
@@ -1630,7 +1792,14 @@ impl Resolver<'_> {
                         .error_token(keyword, "Can't return from top-level code.")
                 }
 
-                value.as_ref().map(|expr| self.resolve_expr(expr));
+                value.as_ref().map(|expr| {
+                    if self.current_function == FunctionType::Initializer {
+                        self.app
+                            .error_token(keyword, "Can't return a value from an initializer.")
+                    }
+
+                    self.resolve_expr(expr)
+                });
             }
             Stmt::Var { name, initializer } => {
                 self.declare(name);
@@ -1643,8 +1812,22 @@ impl Resolver<'_> {
                 self.resolve_expr(condition);
                 self.resolve_stmt(body);
             }
-            _ => panic!("Statement node is not supported yet."),
         }
+    }
+
+    fn resolve_function(&mut self, stmt_function: &StmtFunction, function_type: FunctionType) {
+        let enclosing_function = self.current_function;
+        self.current_function = function_type;
+
+        self.begin_scope();
+        for param in &stmt_function.params {
+            self.declare(&param);
+            self.define(&param);
+        }
+        self.resolve(&stmt_function.body);
+        self.end_scope();
+
+        self.current_function = enclosing_function;
     }
 
     fn resolve_expr(&mut self, expr: &Expr) {
@@ -1685,6 +1868,19 @@ impl Resolver<'_> {
                 }
                 self.resolve_local(*id, name);
             }
+            Expr::Get { object, .. } => self.resolve_expr(object),
+            Expr::Set { object, value, .. } => {
+                self.resolve_expr(value);
+                self.resolve_expr(object);
+            }
+            Expr::This { keyword, id } => {
+                if self.current_class == ClassType::Class {
+                    self.resolve_local(*id, keyword);
+                } else {
+                    self.app
+                        .error_token(keyword, "Can't use 'this' outside of a class.");
+                }
+            }
             _ => panic!("Expression node is not supported yet."),
         }
     }
@@ -1720,5 +1916,77 @@ impl Resolver<'_> {
 
     fn end_scope(&mut self) {
         self.scopes.pop();
+    }
+}
+
+#[derive(Clone)]
+struct Class {
+    name: String,
+    methods: HashMap<String, Value>,
+}
+
+#[derive(Clone)]
+struct Instance(Rc<RefCell<InstanceInner>>);
+
+#[derive(Clone)]
+struct InstanceInner {
+    class: Class,
+    fields: HashMap<String, Value>,
+}
+
+impl Instance {
+    fn new(class: Class) -> Instance {
+        Instance(Rc::new(RefCell::new(InstanceInner {
+            class,
+            fields: HashMap::new(),
+        })))
+    }
+
+    fn get(&self, name: &Token) -> Result<Value, ErrCause> {
+        let Instance(rc) = self;
+        let inner = rc.borrow();
+
+        if let Some(value) = inner.fields.get(&name.lexeme) {
+            Ok(value.clone())
+        } else if let Some(method) = inner.class.methods.get(&name.lexeme) {
+            if let Value::Callable {
+                arity,
+                function: method @ Function::Declared(..),
+            } = method
+            {
+                Ok(Value::Callable {
+                    arity: *arity,
+                    function: method.bind(&self).clone(),
+                })
+            } else {
+                unreachable!()
+            }
+        } else {
+            Err(ErrCause::Error(
+                name.clone(),
+                format!("Undefined property '{}'.", name.lexeme),
+            ))
+        }
+    }
+
+    fn find_method(&self, name: &str) -> Option<Value> {
+        let Instance(rc) = self;
+        let inner = rc.borrow();
+
+        inner.class.methods.get(name).cloned()
+    }
+
+    fn set(&self, name: &Token, value: Value) {
+        let Instance(rc) = self;
+        let mut inner = rc.borrow_mut();
+
+        inner.fields.insert(name.lexeme.clone(), value);
+    }
+
+    fn name(&self) -> String {
+        let Instance(rc) = self;
+        let inner = rc.borrow();
+
+        inner.class.name.clone()
     }
 }
