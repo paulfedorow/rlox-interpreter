@@ -470,6 +470,7 @@ enum Expr {
     Super {
         keyword: Token,
         method: Token,
+        id: ExprId,
     },
 
     This {
@@ -508,7 +509,7 @@ enum Stmt {
 
     Class {
         name: Token,
-        superclass: Option<ExprVariable>,
+        superclass: Option<Expr>,
         methods: Vec<StmtFunction>,
     },
 
@@ -791,6 +792,15 @@ impl Parser<'_> {
                     name: self.previous_token().clone(),
                 },
             ))
+        } else if self.match_one_of([TokenType::Super]) {
+            let keyword = self.previous_token().clone();
+            self.consume(TokenType::Dot, "Expect '.' after 'super'.")?;
+            let method = self.consume(TokenType::Identifier, "Expect superclass method name.")?;
+            Some(Expr::Super {
+                keyword,
+                method,
+                id: self.gen_expr_id(),
+            })
         } else if self.match_one_of([TokenType::This]) {
             Some(Expr::This {
                 keyword: self.previous_token().clone(),
@@ -983,7 +993,20 @@ impl Parser<'_> {
     }
 
     fn class_declaration(&mut self) -> Option<Stmt> {
-        let name = self.consume(TokenType::Identifier, "Expect class name")?;
+        let name = self.consume(TokenType::Identifier, "Expect class name.")?;
+
+        let superclass = if self.match_one_of([TokenType::Less]) {
+            self.consume(TokenType::Identifier, "Expect superclass name.")?;
+            Some(Expr::Variable(
+                self.gen_expr_id(),
+                ExprVariable {
+                    name: self.previous_token().clone(),
+                },
+            ))
+        } else {
+            None
+        };
+
         self.consume(TokenType::LeftBrace, "Expect '{' before class body.")?;
 
         let mut methods = Vec::new();
@@ -995,7 +1018,7 @@ impl Parser<'_> {
 
         Some(Stmt::Class {
             name,
-            superclass: None,
+            superclass,
             methods,
         })
     }
@@ -1136,6 +1159,25 @@ enum Value {
     Nil,
 }
 
+impl Value {
+    fn to_instance(&self) -> Option<&Instance> {
+        match self {
+            Value::Instance(instance) => Some(instance),
+            _ => None,
+        }
+    }
+
+    fn to_class(&self) -> Option<&Class> {
+        match self {
+            Value::Callable {
+                function: Function::Class(class),
+                ..
+            } => Some(class),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum Function {
     Native(fn(&mut Interpreter, &[Value]) -> Result<Value, ErrCause>),
@@ -1169,7 +1211,7 @@ impl Function {
                     ..
                 }) = instance.find_method("init")
                 {
-                    initializer.bind(&instance).call(interpreter, arguments);
+                    initializer.bind(&instance).call(interpreter, arguments)?;
                 }
 
                 Ok(Value::Instance(instance))
@@ -1295,10 +1337,40 @@ impl Interpreter {
                     .borrow_mut()
                     .define(function_stmt.name.lexeme.clone(), function);
             }
-            Stmt::Class { name, methods, .. } => {
+            Stmt::Class {
+                name,
+                methods,
+                superclass,
+            } => {
+                let superclass = if let Some(superclass) = superclass {
+                    let value = self.evaluate(superclass)?;
+                    if value.to_class().is_some() {
+                        Some(value)
+                    } else {
+                        if let Expr::Variable(_, superclass) = superclass {
+                            return Err(ErrCause::Error(
+                                superclass.name.clone(),
+                                String::from("Superclass must be a class."),
+                            ));
+                        } else {
+                            unreachable!();
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 (*self.environment)
                     .borrow_mut()
                     .define(name.lexeme.clone(), Value::Nil);
+
+                if let Some(superclass) = &superclass {
+                    let environment = Environment::new(Some(Rc::clone(&self.environment)));
+                    self.environment = Rc::new(RefCell::new(environment));
+                    (*self.environment)
+                        .borrow_mut()
+                        .define(String::from("super"), superclass.clone())
+                }
 
                 let mut initializer_arity = 0;
                 let mut class_methods = HashMap::new();
@@ -1318,16 +1390,26 @@ impl Interpreter {
                     class_methods.insert(method.name.lexeme.clone(), function);
                 }
 
-                (*self.environment).borrow_mut().assign(
-                    &name,
-                    Value::Callable {
-                        arity: initializer_arity,
-                        function: Function::Class(Class {
-                            name: name.lexeme.clone(),
-                            methods: class_methods,
-                        }),
-                    },
-                )?;
+                if superclass.is_some() {
+                    let enclosing =
+                        Rc::clone(self.environment.borrow().enclosing.as_ref().unwrap());
+                    self.environment = enclosing;
+                }
+
+                let superclass_class = superclass
+                    .map(|superclass| superclass.to_class().cloned())
+                    .flatten();
+
+                let class = Value::Callable {
+                    arity: initializer_arity,
+                    function: Function::Class(Class::new(
+                        name.lexeme.clone(),
+                        class_methods,
+                        superclass_class,
+                    )),
+                };
+
+                (*self.environment).borrow_mut().assign(&name, class)?;
             }
             Stmt::Return { value, .. } => {
                 let return_value = match value {
@@ -1533,7 +1615,23 @@ impl Interpreter {
                 }
             }
             Expr::This { keyword, id } => self.look_up_variable(keyword, *id),
-            _ => panic!("Expression node is not supported yet."),
+            Expr::Super { method, id, .. } => {
+                let distance = self.locals.get(id).cloned().unwrap();
+                let superclass = Environment::get_at(&self.environment, distance, "super");
+                let object = Environment::get_at(&self.environment, distance - 1, "this");
+                let method_value = superclass.to_class().unwrap().find_method(&method.lexeme);
+                match method_value {
+                    Some(Value::Callable { arity, function }) => Ok(Value::Callable {
+                        arity,
+                        function: function.bind(object.to_instance().unwrap()),
+                    }),
+                    None => Err(ErrCause::Error(
+                        method.clone(),
+                        format!("Undefined property '{}'.", method.lexeme),
+                    )),
+                    _ => unreachable!(),
+                }
+            }
         }
     }
 
@@ -1613,7 +1711,7 @@ fn stringify(value: &Value) -> String {
         Value::Callable { function, .. } => match function {
             Function::Native(_) => String::from("<native fn>"),
             Function::Declared(StmtFunction { name, .. }, _, _) => format!("<fn {}>", name.lexeme),
-            Function::Class(Class { name, .. }) => name.clone(),
+            Function::Class(class) => class.name().clone(),
         },
         Value::Instance(instance) => format!("{} instance", instance.name()),
     }
@@ -1719,6 +1817,7 @@ enum FunctionType {
 enum ClassType {
     None,
     Class,
+    Subclass,
 }
 
 impl Resolver<'_> {
@@ -1752,12 +1851,41 @@ impl Resolver<'_> {
 
                 self.resolve_function(&function, FunctionType::Function);
             }
-            Stmt::Class { name, methods, .. } => {
+            Stmt::Class {
+                name,
+                methods,
+                superclass,
+            } => {
                 let enclosing_class = self.current_class;
                 self.current_class = ClassType::Class;
 
                 self.declare(name);
                 self.define(name);
+
+                if let Some(superclass) = superclass {
+                    if let Expr::Variable(
+                        _,
+                        ExprVariable {
+                            name: superclass_name,
+                        },
+                    ) = superclass
+                    {
+                        if superclass_name.lexeme == name.lexeme {
+                            self.app
+                                .error_token(name, "A class can't inherit from itself.");
+                        }
+                    } else {
+                        unreachable!();
+                    }
+
+                    self.current_class = ClassType::Subclass;
+
+                    self.resolve_expr(superclass);
+
+                    self.begin_scope();
+                    let last = self.scopes.len() - 1;
+                    self.scopes[last].insert(String::from("super"), true);
+                }
 
                 self.begin_scope();
                 let last = self.scopes.len() - 1;
@@ -1773,6 +1901,10 @@ impl Resolver<'_> {
                 }
 
                 self.end_scope();
+
+                if superclass.is_some() {
+                    self.end_scope();
+                }
 
                 self.current_class = enclosing_class;
             }
@@ -1881,7 +2013,16 @@ impl Resolver<'_> {
                         .error_token(keyword, "Can't use 'this' outside of a class.");
                 }
             }
-            _ => panic!("Expression node is not supported yet."),
+            Expr::Super { keyword, id, .. } => {
+                if self.current_class == ClassType::None {
+                    self.app
+                        .error_token(keyword, "Can't use 'super' outside of a class.");
+                } else if self.current_class != ClassType::Subclass {
+                    self.app
+                        .error_token(keyword, "Can't use 'super' in a class with no superclass.");
+                }
+                self.resolve_local(*id, keyword);
+            }
         }
     }
 
@@ -1920,9 +2061,39 @@ impl Resolver<'_> {
 }
 
 #[derive(Clone)]
-struct Class {
+struct Class(Rc<RefCell<ClassInner>>);
+
+#[derive(Clone)]
+struct ClassInner {
     name: String,
     methods: HashMap<String, Value>,
+    superclass: Option<Class>,
+}
+
+impl Class {
+    fn new(name: String, methods: HashMap<String, Value>, superclass: Option<Class>) -> Class {
+        Class(Rc::new(RefCell::new(ClassInner {
+            name,
+            methods,
+            superclass,
+        })))
+    }
+
+    fn name(&self) -> String {
+        let inner = self.0.borrow();
+        inner.name.clone()
+    }
+
+    fn find_method(&self, name: &str) -> Option<Value> {
+        let inner = self.0.borrow();
+        inner.methods.get(name).cloned().or_else(|| {
+            inner
+                .superclass
+                .as_ref()
+                .map(|superclass| superclass.find_method(name))
+                .flatten()
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -1943,19 +2114,18 @@ impl Instance {
     }
 
     fn get(&self, name: &Token) -> Result<Value, ErrCause> {
-        let Instance(rc) = self;
-        let inner = rc.borrow();
+        let inner = self.0.borrow();
 
         if let Some(value) = inner.fields.get(&name.lexeme) {
             Ok(value.clone())
-        } else if let Some(method) = inner.class.methods.get(&name.lexeme) {
+        } else if let Some(method) = inner.class.find_method(&name.lexeme) {
             if let Value::Callable {
                 arity,
                 function: method @ Function::Declared(..),
             } = method
             {
                 Ok(Value::Callable {
-                    arity: *arity,
+                    arity,
                     function: method.bind(&self).clone(),
                 })
             } else {
@@ -1970,23 +2140,17 @@ impl Instance {
     }
 
     fn find_method(&self, name: &str) -> Option<Value> {
-        let Instance(rc) = self;
-        let inner = rc.borrow();
-
-        inner.class.methods.get(name).cloned()
+        let inner = self.0.borrow();
+        inner.class.find_method(name)
     }
 
     fn set(&self, name: &Token, value: Value) {
-        let Instance(rc) = self;
-        let mut inner = rc.borrow_mut();
-
+        let mut inner = self.0.borrow_mut();
         inner.fields.insert(name.lexeme.clone(), value);
     }
 
     fn name(&self) -> String {
-        let Instance(rc) = self;
-        let inner = rc.borrow();
-
-        inner.class.name.clone()
+        let inner = self.0.borrow();
+        inner.class.name()
     }
 }
