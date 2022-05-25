@@ -633,7 +633,7 @@ impl Parser<'_> {
 
         expr.as_ref()?;
 
-        while self.match_one_of([TokenType::BangEqual, TokenType::BangEqual]) {
+        while self.match_one_of([TokenType::EqualEqual, TokenType::BangEqual]) {
             let operator = self.previous_token().clone();
             let right = self.comparison()?;
             expr = Some(Expr::Binary {
