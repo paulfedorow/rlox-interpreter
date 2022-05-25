@@ -1529,9 +1529,12 @@ impl Interpreter {
             Expr::Variable(id, ExprVariable { name }) => self.look_up_variable(name, *id),
             Expr::Assign { name, value, id } => {
                 let value = self.evaluate(value)?;
-                let distance = self.locals.get(id);
-                if let Some(distance) = distance {
-                    Environment::assign_at(&self.environment, *distance, &name, value.clone())?;
+                if let Some(distance) = self.locals.get(id).cloned() {
+                    Environment::assign_at(&self.environment, distance, &name, value.clone())?;
+                } else {
+                    self.global_environment
+                        .borrow_mut()
+                        .assign(name, value.clone())?;
                 }
                 Ok(value)
             }
