@@ -2009,11 +2009,11 @@ impl Resolver<'_> {
                 self.resolve_expr(object);
             }
             Expr::This { keyword, id } => {
-                if self.current_class == ClassType::Class {
-                    self.resolve_local(*id, keyword);
-                } else {
+                if self.current_class == ClassType::None {
                     self.app
                         .error_token(keyword, "Can't use 'this' outside of a class.");
+                } else {
+                    self.resolve_local(*id, keyword);
                 }
             }
             Expr::Super { keyword, id, .. } => {
