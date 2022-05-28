@@ -1255,7 +1255,7 @@ impl Interpreter {
                 arity: 0,
                 function: Function::Native(|_, _| {
                     if let Ok(n) = time::SystemTime::now().duration_since(time::UNIX_EPOCH) {
-                        Ok(Value::Number(n.as_secs() as f64))
+                        Ok(Value::Number(n.as_secs_f64()))
                     } else {
                         panic!("SystemTime before UNXI_EPOCH.");
                     }
