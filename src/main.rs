@@ -1155,10 +1155,7 @@ enum Value {
     String(Rc<String>),
     Number(f64),
     Bool(bool),
-    Callable {
-        arity: usize,
-        function: Rc<Function>,
-    },
+    Callable(Rc<Function>),
     Instance(Rc<Instance>),
     Nil,
 }
@@ -1173,8 +1170,8 @@ impl Value {
 
     fn to_class(&self) -> Option<Rc<Class>> {
         match self {
-            Value::Callable { function, .. } => {
-                if let Function::Class(class) = Rc::borrow(function) {
+            Value::Callable(function) => {
+                if let Function::Class(_, class) = Rc::borrow(function) {
                     Some(Rc::clone(class))
                 } else {
                     None
@@ -1186,15 +1183,18 @@ impl Value {
 }
 
 enum Function {
-    Native(fn(&mut Interpreter, &[Value]) -> Result<Value, ErrCause>),
+    Native(
+        usize,
+        fn(&mut Interpreter, &[Value]) -> Result<Value, ErrCause>,
+    ),
     Declared(StmtFunction, Rc<Environment>, bool),
-    Class(Rc<Class>),
+    Class(usize, Rc<Class>),
 }
 
 impl Function {
     fn call(&self, interpreter: &mut Interpreter, arguments: &[Value]) -> Result<Value, ErrCause> {
         match self {
-            Function::Native(function) => function(interpreter, arguments),
+            Function::Native(_, function) => function(interpreter, arguments),
             Function::Declared(StmtFunction { params, body, .. }, closure, is_initializer) => {
                 let environment = Environment::new(Some(Rc::clone(closure)));
 
@@ -1210,13 +1210,9 @@ impl Function {
 
                 result.map(|_| Value::Nil)
             }
-            Function::Class(class) => {
+            Function::Class(_, class) => {
                 let instance = Rc::new(Instance::new(Rc::clone(class)));
-                if let Some(Value::Callable {
-                    function: initializer,
-                    ..
-                }) = instance.find_method("init")
-                {
+                if let Some(Value::Callable(initializer)) = instance.find_method("init") {
                     initializer
                         .bind(Rc::clone(&instance))
                         .call(interpreter, arguments)?;
@@ -1234,6 +1230,14 @@ impl Function {
             Function::Declared(stmt_function.clone(), Rc::new(environment), *is_initializer)
         } else {
             unreachable!()
+        }
+    }
+
+    fn arity(&self) -> usize {
+        match self {
+            Function::Native(arity, _) => *arity,
+            Function::Declared(stmt_function, _, _) => stmt_function.params.len(),
+            Function::Class(arity, _) => *arity,
         }
     }
 }
@@ -1255,16 +1259,13 @@ impl Interpreter {
 
         global_environment.define(
             String::from("clock"),
-            Value::Callable {
-                arity: 0,
-                function: Rc::new(Function::Native(|_, _| {
-                    if let Ok(n) = time::SystemTime::now().duration_since(time::UNIX_EPOCH) {
-                        Ok(Value::Number(n.as_secs_f64()))
-                    } else {
-                        panic!("SystemTime before UNIX_EPOCH.");
-                    }
-                })),
-            },
+            Value::Callable(Rc::new(Function::Native(0, |_, _| {
+                if let Ok(n) = time::SystemTime::now().duration_since(time::UNIX_EPOCH) {
+                    Ok(Value::Number(n.as_secs_f64()))
+                } else {
+                    panic!("SystemTime before UNIX_EPOCH.");
+                }
+            }))),
         );
 
         let environment = Rc::clone(&global_environment);
@@ -1326,14 +1327,11 @@ impl Interpreter {
                 }
             }
             Stmt::Function(function_stmt) => {
-                let function = Value::Callable {
-                    arity: function_stmt.params.len(),
-                    function: Rc::new(Function::Declared(
-                        function_stmt.clone(),
-                        Rc::clone(&self.environment),
-                        false,
-                    )),
-                };
+                let function = Value::Callable(Rc::new(Function::Declared(
+                    function_stmt.clone(),
+                    Rc::clone(&self.environment),
+                    false,
+                )));
 
                 self.environment
                     .define(function_stmt.name.lexeme.clone(), function);
@@ -1377,14 +1375,11 @@ impl Interpreter {
                     if is_initializer {
                         initializer_arity = method.params.len();
                     }
-                    let function = Value::Callable {
-                        arity: method.params.len(),
-                        function: Rc::new(Function::Declared(
-                            method.clone(),
-                            Rc::clone(&self.environment),
-                            is_initializer,
-                        )),
-                    };
+                    let function = Value::Callable(Rc::new(Function::Declared(
+                        method.clone(),
+                        Rc::clone(&self.environment),
+                        is_initializer,
+                    )));
                     class_methods.insert(method.name.lexeme.clone(), function);
                 }
 
@@ -1396,14 +1391,14 @@ impl Interpreter {
                     .map(|superclass| superclass.to_class())
                     .flatten();
 
-                let class = Value::Callable {
-                    arity: initializer_arity,
-                    function: Rc::new(Function::Class(Rc::new(Class {
+                let class = Value::Callable(Rc::new(Function::Class(
+                    initializer_arity,
+                    Rc::new(Class {
                         name: name.lexeme.clone(),
                         methods: class_methods,
                         superclass,
-                    }))),
-                };
+                    }),
+                )));
 
                 self.environment.assign(&name, class)?;
             }
@@ -1561,8 +1556,8 @@ impl Interpreter {
                     argument_values.push(self.evaluate(argument)?);
                 }
 
-                if let Value::Callable { arity, function } = callee {
-                    if argument_values.len() == arity {
+                if let Value::Callable(function) = callee {
+                    if argument_values.len() == function.arity() {
                         let f: &Function = Rc::borrow(&function);
                         match f.call(self, &argument_values) {
                             Err(ErrCause::Return(value)) => Ok(value),
@@ -1571,7 +1566,7 @@ impl Interpreter {
                     } else {
                         let message = format!(
                             "Expected {} arguments but got {} .",
-                            arity,
+                            function.arity(),
                             argument_values.len()
                         );
                         Err(ErrCause::Error(paren.clone(), message))
@@ -1619,10 +1614,9 @@ impl Interpreter {
                 let object = Environment::get_at(&self.environment, distance - 1, "this");
                 let method_value = superclass.to_class().unwrap().find_method(&method.lexeme);
                 match method_value {
-                    Some(Value::Callable { arity, function }) => Ok(Value::Callable {
-                        arity,
-                        function: Rc::new(function.bind(object.to_instance().unwrap())),
-                    }),
+                    Some(Value::Callable(function)) => Ok(Value::Callable(Rc::new(
+                        function.bind(object.to_instance().unwrap()),
+                    ))),
                     None => Err(ErrCause::Error(
                         method.clone(),
                         format!("Undefined property '{}'.", method.lexeme),
@@ -1706,10 +1700,10 @@ fn stringify(value: &Value) -> String {
             }
         }
         Value::Nil => String::from("nil"),
-        Value::Callable { function, .. } => match &*Rc::borrow(function) {
-            Function::Native(_) => String::from("<native fn>"),
-            Function::Declared(StmtFunction { name, .. }, _, _) => format!("<fn {}>", name.lexeme),
-            Function::Class(class) => class.name.clone(),
+        Value::Callable(function) => match &*Rc::borrow(function) {
+            Function::Native(..) => String::from("<native fn>"),
+            Function::Declared(StmtFunction { name, .. }, ..) => format!("<fn {}>", name.lexeme),
+            Function::Class(_, class) => class.name.clone(),
         },
         Value::Instance(instance) => format!("{} instance", instance.class.name),
     }
@@ -2083,12 +2077,9 @@ impl RcInstanceExt for Rc<Instance> {
         if let Some(value) = self.fields.borrow().get(&name.lexeme) {
             Ok(value.clone())
         } else if let Some(method) = self.class.find_method(&name.lexeme) {
-            if let Value::Callable { arity, function } = method {
+            if let Value::Callable(function) = method {
                 if let Function::Declared(..) = &*Rc::borrow(&function) {
-                    Ok(Value::Callable {
-                        arity,
-                        function: Rc::new(function.bind(Rc::clone(self))),
-                    })
+                    Ok(Value::Callable(Rc::new(function.bind(Rc::clone(self)))))
                 } else {
                     unreachable!()
                 }
