@@ -1159,23 +1159,23 @@ enum Value {
         arity: usize,
         function: Rc<Function>,
     },
-    Instance(Instance),
+    Instance(Rc<Instance>),
     Nil,
 }
 
 impl Value {
-    fn to_instance(&self) -> Option<&Instance> {
+    fn to_instance(&self) -> Option<Rc<Instance>> {
         match self {
-            Value::Instance(instance) => Some(instance),
+            Value::Instance(instance) => Some(Rc::clone(instance)),
             _ => None,
         }
     }
 
-    fn to_class(&self) -> Option<Class> {
+    fn to_class(&self) -> Option<Rc<Class>> {
         match self {
             Value::Callable { function, .. } => {
-                if let Function::Class(class) = Rc::borrow(&function) {
-                    Some(class.clone())
+                if let Function::Class(class) = Rc::borrow(function) {
+                    Some(Rc::clone(class))
                 } else {
                     None
                 }
@@ -1187,8 +1187,8 @@ impl Value {
 
 enum Function {
     Native(fn(&mut Interpreter, &[Value]) -> Result<Value, ErrCause>),
-    Declared(StmtFunction, Rc<RefCell<Environment>>, bool),
-    Class(Class),
+    Declared(StmtFunction, Rc<Environment>, bool),
+    Class(Rc<Class>),
 }
 
 impl Function {
@@ -1196,7 +1196,7 @@ impl Function {
         match self {
             Function::Native(function) => function(interpreter, arguments),
             Function::Declared(StmtFunction { params, body, .. }, closure, is_initializer) => {
-                let mut environment = Environment::new(Some(Rc::clone(closure)));
+                let environment = Environment::new(Some(Rc::clone(closure)));
 
                 for i in 0..params.len() {
                     environment.define(params[i].lexeme.clone(), arguments[i].clone())
@@ -1205,19 +1205,21 @@ impl Function {
                 let result = interpreter.execute_block(body, environment);
 
                 if *is_initializer {
-                    return Ok(RefCell::borrow(closure).values.get("this").unwrap().clone());
+                    return Ok(closure.values.borrow().get("this").unwrap().clone());
                 }
 
                 result.map(|_| Value::Nil)
             }
             Function::Class(class) => {
-                let instance = Instance::new(class.clone());
+                let instance = Rc::new(Instance::new(Rc::clone(class)));
                 if let Some(Value::Callable {
                     function: initializer,
                     ..
                 }) = instance.find_method("init")
                 {
-                    initializer.bind(&instance).call(interpreter, arguments)?;
+                    initializer
+                        .bind(Rc::clone(&instance))
+                        .call(interpreter, arguments)?;
                 }
 
                 Ok(Value::Instance(instance))
@@ -1225,15 +1227,11 @@ impl Function {
         }
     }
 
-    fn bind(&self, instance: &Instance) -> Function {
+    fn bind(&self, instance: Rc<Instance>) -> Function {
         if let Function::Declared(stmt_function, closure, is_initializer) = self {
-            let mut environment = Environment::new(Some(Rc::clone(closure)));
-            environment.define(String::from("this"), Value::Instance(instance.clone()));
-            Function::Declared(
-                stmt_function.clone(),
-                Rc::new(RefCell::new(environment)),
-                *is_initializer,
-            )
+            let environment = Environment::new(Some(Rc::clone(closure)));
+            environment.define(String::from("this"), Value::Instance(instance));
+            Function::Declared(stmt_function.clone(), Rc::new(environment), *is_initializer)
         } else {
             unreachable!()
         }
@@ -1241,8 +1239,8 @@ impl Function {
 }
 
 struct Interpreter {
-    global_environment: Rc<RefCell<Environment>>,
-    environment: Rc<RefCell<Environment>>,
+    global_environment: Rc<Environment>,
+    environment: Rc<Environment>,
     locals: HashMap<ExprId, usize>,
 }
 
@@ -1253,9 +1251,9 @@ enum ErrCause {
 
 impl Interpreter {
     fn new() -> Interpreter {
-        let global_environment = Rc::new(RefCell::new(Environment::new(None)));
+        let global_environment = Rc::new(Environment::new(None));
 
-        (*global_environment).borrow_mut().define(
+        global_environment.define(
             String::from("clock"),
             Value::Callable {
                 arity: 0,
@@ -1263,7 +1261,7 @@ impl Interpreter {
                     if let Ok(n) = time::SystemTime::now().duration_since(time::UNIX_EPOCH) {
                         Ok(Value::Number(n.as_secs_f64()))
                     } else {
-                        panic!("SystemTime before UNXI_EPOCH.");
+                        panic!("SystemTime before UNIX_EPOCH.");
                     }
                 })),
             },
@@ -1305,9 +1303,7 @@ impl Interpreter {
                     Some(expr) => self.evaluate(expr)?,
                     _ => Value::Nil,
                 };
-                (*self.environment)
-                    .borrow_mut()
-                    .define(name.lexeme.clone(), value);
+                self.environment.define(name.lexeme.clone(), value);
             }
             Stmt::Block { statements } => {
                 let environment = Environment::new(Some(Rc::clone(&self.environment)));
@@ -1339,8 +1335,7 @@ impl Interpreter {
                     )),
                 };
 
-                (*self.environment)
-                    .borrow_mut()
+                self.environment
                     .define(function_stmt.name.lexeme.clone(), function);
             }
             Stmt::Class {
@@ -1348,7 +1343,7 @@ impl Interpreter {
                 methods,
                 superclass,
             } => {
-                let superclass = if let Some(superclass) = superclass {
+                let superclass_value = if let Some(superclass) = superclass {
                     let value = self.evaluate(superclass)?;
                     if value.to_class().is_some() {
                         Some(value)
@@ -1366,15 +1361,12 @@ impl Interpreter {
                     None
                 };
 
-                (*self.environment)
-                    .borrow_mut()
-                    .define(name.lexeme.clone(), Value::Nil);
+                self.environment.define(name.lexeme.clone(), Value::Nil);
 
-                if let Some(superclass) = &superclass {
+                if let Some(superclass) = &superclass_value {
                     let environment = Environment::new(Some(Rc::clone(&self.environment)));
-                    self.environment = Rc::new(RefCell::new(environment));
-                    (*self.environment)
-                        .borrow_mut()
+                    self.environment = Rc::new(environment);
+                    self.environment
                         .define(String::from("super"), superclass.clone())
                 }
 
@@ -1396,28 +1388,24 @@ impl Interpreter {
                     class_methods.insert(method.name.lexeme.clone(), function);
                 }
 
-                if superclass.is_some() {
-                    let enclosing = Rc::clone(
-                        RefCell::borrow(&self.environment)
-                            .enclosing
-                            .as_ref()
-                            .unwrap(),
-                    );
-                    self.environment = enclosing;
+                if superclass_value.is_some() {
+                    self.environment = Rc::clone(&self.environment.enclosing.as_ref().unwrap());
                 }
 
-                let superclass_class = superclass.map(|superclass| superclass.to_class()).flatten();
+                let superclass = superclass_value
+                    .map(|superclass| superclass.to_class())
+                    .flatten();
 
                 let class = Value::Callable {
                     arity: initializer_arity,
-                    function: Rc::new(Function::Class(Class::new(
-                        name.lexeme.clone(),
-                        class_methods,
-                        superclass_class,
-                    ))),
+                    function: Rc::new(Function::Class(Rc::new(Class {
+                        name: name.lexeme.clone(),
+                        methods: class_methods,
+                        superclass,
+                    }))),
                 };
 
-                (*self.environment).borrow_mut().assign(&name, class)?;
+                self.environment.assign(&name, class)?;
             }
             Stmt::Return { value, .. } => {
                 let return_value = match value {
@@ -1437,7 +1425,7 @@ impl Interpreter {
         environment: Environment,
     ) -> Result<(), ErrCause> {
         let previous = Rc::clone(&self.environment);
-        self.environment = Rc::new(RefCell::new(environment));
+        self.environment = Rc::new(environment);
 
         let mut ret = Ok(());
         for statement in statements {
@@ -1540,9 +1528,7 @@ impl Interpreter {
                 if let Some(distance) = self.locals.get(id).cloned() {
                     Environment::assign_at(&self.environment, distance, &name, value.clone())?;
                 } else {
-                    self.global_environment
-                        .borrow_mut()
-                        .assign(name, value.clone())?;
+                    self.global_environment.assign(name, value.clone())?;
                 }
                 Ok(value)
             }
@@ -1660,7 +1646,7 @@ impl Interpreter {
                 &name.lexeme,
             ))
         } else {
-            (*self.global_environment).borrow_mut().get(name)
+            self.global_environment.get(name)
         }
     }
 
@@ -1723,86 +1709,80 @@ fn stringify(value: &Value) -> String {
         Value::Callable { function, .. } => match &*Rc::borrow(function) {
             Function::Native(_) => String::from("<native fn>"),
             Function::Declared(StmtFunction { name, .. }, _, _) => format!("<fn {}>", name.lexeme),
-            Function::Class(class) => class.name().clone(),
+            Function::Class(class) => class.name.clone(),
         },
-        Value::Instance(instance) => format!("{} instance", instance.name()),
+        Value::Instance(instance) => format!("{} instance", instance.class.name),
     }
 }
 
 #[derive(Clone)]
 struct Environment {
-    values: HashMap<String, Value>,
-    enclosing: Option<Rc<RefCell<Environment>>>,
+    values: RefCell<HashMap<String, Value>>,
+    enclosing: Option<Rc<Environment>>,
 }
 
 impl Environment {
-    fn new(enclosing: Option<Rc<RefCell<Environment>>>) -> Environment {
+    fn new(enclosing: Option<Rc<Environment>>) -> Environment {
         Environment {
-            values: HashMap::new(),
+            values: RefCell::new(HashMap::new()),
             enclosing,
         }
     }
 
-    fn define(&mut self, name: String, value: Value) {
-        self.values.insert(name, value);
+    fn define(&self, name: String, value: Value) {
+        self.values.borrow_mut().insert(name, value);
     }
 
-    fn assign(&mut self, name: &Token, value: Value) -> Result<(), ErrCause> {
-        match self.values.get(&name.lexeme) {
-            Some(_) => {
-                self.values.insert(name.lexeme.clone(), value);
-                Ok(())
-            }
-            None => self.enclosing.as_mut().map_or(
+    fn assign(&self, name: &Token, value: Value) -> Result<(), ErrCause> {
+        if self.values.borrow().get(&name.lexeme).is_some() {
+            self.values.borrow_mut().insert(name.lexeme.clone(), value);
+            Ok(())
+        } else {
+            self.enclosing.as_ref().map_or(
                 Err(ErrCause::Error(
                     name.clone(),
                     format!("Undefined variable '{}'.", name.lexeme),
                 )),
-                |enclosing| (**enclosing).borrow_mut().assign(name, value),
-            ),
+                |enclosing| enclosing.assign(name, value),
+            )
         }
     }
 
-    fn get(&mut self, name: &Token) -> Result<Value, ErrCause> {
-        match self.values.get(&name.lexeme) {
+    fn get(&self, name: &Token) -> Result<Value, ErrCause> {
+        match self.values.borrow().get(&name.lexeme) {
             Some(value) => Ok(value.clone()),
-            None => self.enclosing.as_mut().map_or(
+            None => self.enclosing.as_ref().map_or(
                 Err(ErrCause::Error(
                     name.clone(),
                     format!("Undefined variable '{}'.", name.lexeme),
                 )),
-                |enclosing| (**enclosing).borrow_mut().get(name),
+                |enclosing| enclosing.get(name),
             ),
         }
     }
 
-    fn get_at(environment: &Rc<RefCell<Environment>>, distance: usize, name: &str) -> Value {
-        (*Environment::ancestor(environment, distance))
-            .borrow_mut()
+    fn get_at(environment: &Rc<Environment>, distance: usize, name: &str) -> Value {
+        Environment::ancestor(environment, distance)
             .values
+            .borrow()
             .get(name)
             .unwrap()
             .clone()
     }
 
     fn assign_at(
-        environment: &Rc<RefCell<Environment>>,
+        environment: &Rc<Environment>,
         distance: usize,
         name: &Token,
         value: Value,
     ) -> Result<(), ErrCause> {
-        (*Environment::ancestor(environment, distance))
-            .borrow_mut()
-            .assign(name, value)
+        Environment::ancestor(environment, distance).assign(name, value)
     }
 
-    fn ancestor(
-        environment: &Rc<RefCell<Environment>>,
-        distance: usize,
-    ) -> Rc<RefCell<Environment>> {
+    fn ancestor(environment: &Rc<Environment>, distance: usize) -> Rc<Environment> {
         let mut env = Rc::clone(environment);
         for _ in 0..distance {
-            let enclosing = Rc::clone(RefCell::borrow(&env).enclosing.as_ref().unwrap());
+            let enclosing = Rc::clone(env.enclosing.as_ref().unwrap());
             env = enclosing;
         }
         env
@@ -2072,35 +2052,16 @@ impl Resolver<'_> {
     }
 }
 
-#[derive(Clone)]
-struct Class(Rc<RefCell<ClassInner>>);
-
-#[derive(Clone)]
-struct ClassInner {
+struct Class {
     name: String,
     methods: HashMap<String, Value>,
-    superclass: Option<Class>,
+    superclass: Option<Rc<Class>>,
 }
 
 impl Class {
-    fn new(name: String, methods: HashMap<String, Value>, superclass: Option<Class>) -> Class {
-        Class(Rc::new(RefCell::new(ClassInner {
-            name,
-            methods,
-            superclass,
-        })))
-    }
-
-    fn name(&self) -> String {
-        let inner = RefCell::borrow(&self.0);
-        inner.name.clone()
-    }
-
     fn find_method(&self, name: &str) -> Option<Value> {
-        let inner = RefCell::borrow(&self.0);
-        inner.methods.get(name).cloned().or_else(|| {
-            inner
-                .superclass
+        self.methods.get(name).cloned().or_else(|| {
+            self.superclass
                 .as_ref()
                 .map(|superclass| superclass.find_method(name))
                 .flatten()
@@ -2108,34 +2069,25 @@ impl Class {
     }
 }
 
-#[derive(Clone)]
-struct Instance(Rc<RefCell<InstanceInner>>);
-
-#[derive(Clone)]
-struct InstanceInner {
-    class: Class,
-    fields: HashMap<String, Value>,
+struct Instance {
+    class: Rc<Class>,
+    fields: RefCell<HashMap<String, Value>>,
 }
 
-impl Instance {
-    fn new(class: Class) -> Instance {
-        Instance(Rc::new(RefCell::new(InstanceInner {
-            class,
-            fields: HashMap::new(),
-        })))
-    }
+trait RcInstanceExt {
+    fn get(&self, name: &Token) -> Result<Value, ErrCause>;
+}
 
+impl RcInstanceExt for Rc<Instance> {
     fn get(&self, name: &Token) -> Result<Value, ErrCause> {
-        let inner = RefCell::borrow(&self.0);
-
-        if let Some(value) = inner.fields.get(&name.lexeme) {
+        if let Some(value) = self.fields.borrow().get(&name.lexeme) {
             Ok(value.clone())
-        } else if let Some(method) = inner.class.find_method(&name.lexeme) {
+        } else if let Some(method) = self.class.find_method(&name.lexeme) {
             if let Value::Callable { arity, function } = method {
                 if let Function::Declared(..) = &*Rc::borrow(&function) {
                     Ok(Value::Callable {
                         arity,
-                        function: Rc::new(function.bind(&self)),
+                        function: Rc::new(function.bind(Rc::clone(self))),
                     })
                 } else {
                     unreachable!()
@@ -2150,19 +2102,21 @@ impl Instance {
             ))
         }
     }
+}
+
+impl Instance {
+    fn new(class: Rc<Class>) -> Instance {
+        Instance {
+            class,
+            fields: RefCell::new(HashMap::new()),
+        }
+    }
 
     fn find_method(&self, name: &str) -> Option<Value> {
-        let inner = RefCell::borrow(&self.0);
-        inner.class.find_method(name)
+        self.class.find_method(name)
     }
 
     fn set(&self, name: &Token, value: Value) {
-        let mut inner = self.0.borrow_mut();
-        inner.fields.insert(name.lexeme.clone(), value);
-    }
-
-    fn name(&self) -> String {
-        let inner = RefCell::borrow(&self.0);
-        inner.class.name()
+        self.fields.borrow_mut().insert(name.lexeme.clone(), value);
     }
 }
