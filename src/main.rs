@@ -1152,7 +1152,7 @@ impl Parser<'_> {
 
 #[derive(Clone)]
 enum Value {
-    String(String),
+    String(Rc<String>),
     Number(f64),
     Bool(bool),
     Callable {
@@ -1471,7 +1471,7 @@ impl Interpreter {
                             Ok(Value::Number(left_num + right_num))
                         }
                         (Value::String(left_str), Value::String(right_str)) => {
-                            Ok(Value::String(left_str + &right_str))
+                            Ok(Value::String(Rc::from((&*left_str).clone() + &*right_str)))
                         }
                         _ => Err(ErrCause::Error(
                             operator.clone(),
@@ -1505,7 +1505,7 @@ impl Interpreter {
             }
             Expr::Grouping { expression } => self.evaluate(expression),
             Expr::Literal { value } => match value {
-                TokenLiteral::String(str) => Ok(Value::String(str.clone())),
+                TokenLiteral::String(str) => Ok(Value::String(Rc::new(str.clone()))),
                 TokenLiteral::Number(num) => Ok(Value::Number(*num)),
                 TokenLiteral::Bool(bool) => Ok(Value::Bool(*bool)),
                 TokenLiteral::Nil => Ok(Value::Nil),
@@ -1696,7 +1696,7 @@ fn is_equal(left: &Value, right: &Value) -> bool {
 
 fn stringify(value: &Value) -> String {
     match value {
-        Value::String(str) => str.clone(),
+        Value::String(str) => str.as_ref().clone(),
         Value::Number(num) => format!("{}", num),
         Value::Bool(b) => {
             if *b {
