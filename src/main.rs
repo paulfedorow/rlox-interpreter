@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -1154,7 +1155,10 @@ enum Value {
     String(String),
     Number(f64),
     Bool(bool),
-    Callable { arity: usize, function: Function },
+    Callable {
+        arity: usize,
+        function: Rc<Function>,
+    },
     Instance(Instance),
     Nil,
 }
@@ -1167,18 +1171,20 @@ impl Value {
         }
     }
 
-    fn to_class(&self) -> Option<&Class> {
+    fn to_class(&self) -> Option<Class> {
         match self {
-            Value::Callable {
-                function: Function::Class(class),
-                ..
-            } => Some(class),
+            Value::Callable { function, .. } => {
+                if let Function::Class(class) = Rc::borrow(&function) {
+                    Some(class.clone())
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
 }
 
-#[derive(Clone)]
 enum Function {
     Native(fn(&mut Interpreter, &[Value]) -> Result<Value, ErrCause>),
     Declared(StmtFunction, Rc<RefCell<Environment>>, bool),
@@ -1199,7 +1205,7 @@ impl Function {
                 let result = interpreter.execute_block(body, environment);
 
                 if *is_initializer {
-                    return Ok(closure.borrow().values.get("this").unwrap().clone());
+                    return Ok(RefCell::borrow(closure).values.get("this").unwrap().clone());
                 }
 
                 result.map(|_| Value::Nil)
@@ -1253,13 +1259,13 @@ impl Interpreter {
             String::from("clock"),
             Value::Callable {
                 arity: 0,
-                function: Function::Native(|_, _| {
+                function: Rc::new(Function::Native(|_, _| {
                     if let Ok(n) = time::SystemTime::now().duration_since(time::UNIX_EPOCH) {
                         Ok(Value::Number(n.as_secs_f64()))
                     } else {
                         panic!("SystemTime before UNXI_EPOCH.");
                     }
-                }),
+                })),
             },
         );
 
@@ -1326,11 +1332,11 @@ impl Interpreter {
             Stmt::Function(function_stmt) => {
                 let function = Value::Callable {
                     arity: function_stmt.params.len(),
-                    function: Function::Declared(
+                    function: Rc::new(Function::Declared(
                         function_stmt.clone(),
                         Rc::clone(&self.environment),
                         false,
-                    ),
+                    )),
                 };
 
                 (*self.environment)
@@ -1381,32 +1387,34 @@ impl Interpreter {
                     }
                     let function = Value::Callable {
                         arity: method.params.len(),
-                        function: Function::Declared(
+                        function: Rc::new(Function::Declared(
                             method.clone(),
                             Rc::clone(&self.environment),
                             is_initializer,
-                        ),
+                        )),
                     };
                     class_methods.insert(method.name.lexeme.clone(), function);
                 }
 
                 if superclass.is_some() {
-                    let enclosing =
-                        Rc::clone(self.environment.borrow().enclosing.as_ref().unwrap());
+                    let enclosing = Rc::clone(
+                        RefCell::borrow(&self.environment)
+                            .enclosing
+                            .as_ref()
+                            .unwrap(),
+                    );
                     self.environment = enclosing;
                 }
 
-                let superclass_class = superclass
-                    .map(|superclass| superclass.to_class().cloned())
-                    .flatten();
+                let superclass_class = superclass.map(|superclass| superclass.to_class()).flatten();
 
                 let class = Value::Callable {
                     arity: initializer_arity,
-                    function: Function::Class(Class::new(
+                    function: Rc::new(Function::Class(Class::new(
                         name.lexeme.clone(),
                         class_methods,
                         superclass_class,
-                    )),
+                    ))),
                 };
 
                 (*self.environment).borrow_mut().assign(&name, class)?;
@@ -1569,7 +1577,8 @@ impl Interpreter {
 
                 if let Value::Callable { arity, function } = callee {
                     if argument_values.len() == arity {
-                        match function.call(self, &argument_values) {
+                        let f: &Function = Rc::borrow(&function);
+                        match f.call(self, &argument_values) {
                             Err(ErrCause::Return(value)) => Ok(value),
                             result => result,
                         }
@@ -1626,7 +1635,7 @@ impl Interpreter {
                 match method_value {
                     Some(Value::Callable { arity, function }) => Ok(Value::Callable {
                         arity,
-                        function: function.bind(object.to_instance().unwrap()),
+                        function: Rc::new(function.bind(object.to_instance().unwrap())),
                     }),
                     None => Err(ErrCause::Error(
                         method.clone(),
@@ -1711,7 +1720,7 @@ fn stringify(value: &Value) -> String {
             }
         }
         Value::Nil => String::from("nil"),
-        Value::Callable { function, .. } => match function {
+        Value::Callable { function, .. } => match &*Rc::borrow(function) {
             Function::Native(_) => String::from("<native fn>"),
             Function::Declared(StmtFunction { name, .. }, _, _) => format!("<fn {}>", name.lexeme),
             Function::Class(class) => class.name().clone(),
@@ -1793,7 +1802,7 @@ impl Environment {
     ) -> Rc<RefCell<Environment>> {
         let mut env = Rc::clone(environment);
         for _ in 0..distance {
-            let enclosing = Rc::clone(env.borrow().enclosing.as_ref().unwrap());
+            let enclosing = Rc::clone(RefCell::borrow(&env).enclosing.as_ref().unwrap());
             env = enclosing;
         }
         env
@@ -2083,12 +2092,12 @@ impl Class {
     }
 
     fn name(&self) -> String {
-        let inner = self.0.borrow();
+        let inner = RefCell::borrow(&self.0);
         inner.name.clone()
     }
 
     fn find_method(&self, name: &str) -> Option<Value> {
-        let inner = self.0.borrow();
+        let inner = RefCell::borrow(&self.0);
         inner.methods.get(name).cloned().or_else(|| {
             inner
                 .superclass
@@ -2117,20 +2126,20 @@ impl Instance {
     }
 
     fn get(&self, name: &Token) -> Result<Value, ErrCause> {
-        let inner = self.0.borrow();
+        let inner = RefCell::borrow(&self.0);
 
         if let Some(value) = inner.fields.get(&name.lexeme) {
             Ok(value.clone())
         } else if let Some(method) = inner.class.find_method(&name.lexeme) {
-            if let Value::Callable {
-                arity,
-                function: method @ Function::Declared(..),
-            } = method
-            {
-                Ok(Value::Callable {
-                    arity,
-                    function: method.bind(&self).clone(),
-                })
+            if let Value::Callable { arity, function } = method {
+                if let Function::Declared(..) = &*Rc::borrow(&function) {
+                    Ok(Value::Callable {
+                        arity,
+                        function: Rc::new(function.bind(&self)),
+                    })
+                } else {
+                    unreachable!()
+                }
             } else {
                 unreachable!()
             }
@@ -2143,7 +2152,7 @@ impl Instance {
     }
 
     fn find_method(&self, name: &str) -> Option<Value> {
-        let inner = self.0.borrow();
+        let inner = RefCell::borrow(&self.0);
         inner.class.find_method(name)
     }
 
@@ -2153,7 +2162,7 @@ impl Instance {
     }
 
     fn name(&self) -> String {
-        let inner = self.0.borrow();
+        let inner = RefCell::borrow(&self.0);
         inner.class.name()
     }
 }
