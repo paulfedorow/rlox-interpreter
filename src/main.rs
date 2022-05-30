@@ -541,7 +541,6 @@ struct ExprVariable {
     name: Token,
 }
 
-#[derive(Clone)]
 struct StmtFunction {
     name: Token,
     params: Vec<Token>,
@@ -557,12 +556,12 @@ enum Stmt {
     Class {
         name: Token,
         superclass: Option<Expr>,
-        methods: Vec<StmtFunction>,
+        methods: Vec<Rc<StmtFunction>>,
     },
 
     Expression(Expr),
 
-    Function(StmtFunction),
+    Function(Rc<StmtFunction>),
 
     If {
         condition: Expr,
@@ -1025,7 +1024,8 @@ impl Parser<'_> {
         if self.match_one_of([TokenType::Class]) {
             self.class_declaration()
         } else if self.match_one_of([TokenType::Fun]) {
-            self.function("function").map(|f| Stmt::Function(f))
+            self.function("function")
+                .map(|f| Stmt::Function(Rc::new(f)))
         } else if self.match_one_of([TokenType::Var]) {
             self.var_declaration()
         } else {
@@ -1058,7 +1058,7 @@ impl Parser<'_> {
 
         let mut methods = Vec::new();
         while !self.check_token(TokenType::RightBrace) && !self.is_at_end() {
-            methods.push(self.function("method")?);
+            methods.push(Rc::new(self.function("method")?));
         }
 
         self.consume(TokenType::RightBrace, "Expect '}' after class body.")?;
@@ -1245,7 +1245,7 @@ enum Function {
         usize,
         fn(&mut Interpreter, &[Value]) -> Result<Value, ErrCause>,
     ),
-    Declared(StmtFunction, Rc<Environment>, bool),
+    Declared(Rc<StmtFunction>, Rc<Environment>, bool),
     Class(usize, Rc<Class>),
 }
 
@@ -1258,7 +1258,9 @@ impl Function {
     ) -> Result<Value, ErrCause> {
         match self {
             Function::Native(_, function) => function(interpreter, arguments),
-            Function::Declared(StmtFunction { params, body, .. }, closure, is_initializer) => {
+            Function::Declared(stmt_function, closure, is_initializer) => {
+                let StmtFunction { params, body, .. } = Rc::borrow(stmt_function);
+
                 let environment = Environment::new(Some(Rc::clone(closure)));
 
                 for i in 0..params.len() {
@@ -1298,7 +1300,11 @@ impl Function {
         if let Function::Declared(stmt_function, closure, is_initializer) = self {
             let environment = Environment::new(Some(Rc::clone(closure)));
             environment.define(interner.sym_this, Value::Instance(instance));
-            Function::Declared(stmt_function.clone(), Rc::new(environment), *is_initializer)
+            Function::Declared(
+                Rc::clone(stmt_function),
+                Rc::new(environment),
+                *is_initializer,
+            )
         } else {
             unreachable!()
         }
@@ -1795,7 +1801,8 @@ fn stringify(interner: &Interner, value: &Value) -> String {
         Value::Nil => String::from("nil"),
         Value::Callable(function) => match &*Rc::borrow(function) {
             Function::Native(..) => String::from("<native fn>"),
-            Function::Declared(StmtFunction { name, .. }, ..) => {
+            Function::Declared(stmt_function, ..) => {
+                let StmtFunction { name, .. } = Rc::borrow(stmt_function);
                 format!("<fn {}>", interner.resolve(name.lexeme))
             }
             Function::Class(_, class) => interner.resolve(class.name),
