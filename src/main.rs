@@ -5,12 +5,52 @@ use std::io::{BufRead, Write};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::{env, fs, io, str, time};
+use string_interner::backend::StringBackend;
+use string_interner::symbol::SymbolU32;
+use string_interner::StringInterner;
+
+type Symbol = SymbolU32;
+
+struct Interner {
+    interner: RefCell<StringInterner<StringBackend<Symbol>>>,
+    sym_this: Symbol,
+    sym_init: Symbol,
+    sym_super: Symbol,
+}
+
+impl Interner {
+    fn new() -> Interner {
+        let mut interner = StringInterner::<StringBackend<Symbol>>::new();
+        Interner {
+            sym_this: interner.get_or_intern("this"),
+            sym_init: interner.get_or_intern("init"),
+            sym_super: interner.get_or_intern("super"),
+            interner: RefCell::new(interner),
+        }
+    }
+
+    fn resolve(&self, symbol: Symbol) -> String {
+        String::from(
+            self.interner
+                .borrow()
+                .resolve(symbol)
+                .expect("Resolving an invalid symbol"),
+        )
+    }
+
+    fn get_or_intern<T>(&self, string: T) -> Symbol
+    where
+        T: AsRef<str>,
+    {
+        self.interner.borrow_mut().get_or_intern(string)
+    }
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
     let app = App::new();
-    let mut interpreter = Interpreter::new();
+    let mut interpreter = Interpreter::new(&app.interner);
 
     match &args[..] {
         [_] => app.run_prompt(&mut interpreter),
@@ -25,6 +65,7 @@ fn main() {
 struct App {
     had_error: Cell<bool>,
     had_runtime_error: Cell<bool>,
+    interner: Interner,
 }
 
 impl App {
@@ -32,6 +73,7 @@ impl App {
         App {
             had_error: Cell::new(false),
             had_runtime_error: Cell::new(false),
+            interner: Interner::new(),
         }
     }
 
@@ -43,7 +85,11 @@ impl App {
         if token.token_type == TokenType::Eof {
             self.report(token.line, " at end", message);
         } else {
-            self.report(token.line, &format!(" at '{}'", token.lexeme), message);
+            self.report(
+                token.line,
+                &format!(" at '{}'", self.interner.resolve(token.lexeme)),
+                message,
+            );
         }
     }
 
@@ -151,7 +197,7 @@ impl Scanner<'_> {
 
         self.tokens.push(Token {
             token_type: TokenType::Eof,
-            lexeme: String::from(""),
+            lexeme: self.app.interner.get_or_intern("<EOF>"),
             literal: TokenLiteral::Nil,
             line: self.line,
         });
@@ -341,7 +387,7 @@ impl Scanner<'_> {
         let lexeme = str::from_utf8(&self.source[self.start..self.current]).unwrap();
         self.tokens.push(Token {
             token_type,
-            lexeme: lexeme.to_string(),
+            lexeme: self.app.interner.get_or_intern(lexeme),
             literal,
             line: self.line,
         })
@@ -398,7 +444,7 @@ enum TokenType {
 #[derive(Debug, Clone)]
 struct Token {
     token_type: TokenType,
-    lexeme: String,
+    lexeme: Symbol,
     literal: TokenLiteral,
     line: u64,
 }
@@ -1192,7 +1238,12 @@ enum Function {
 }
 
 impl Function {
-    fn call(&self, interpreter: &mut Interpreter, arguments: &[Value]) -> Result<Value, ErrCause> {
+    fn call(
+        &self,
+        interpreter: &mut Interpreter,
+        interner: &Interner,
+        arguments: &[Value],
+    ) -> Result<Value, ErrCause> {
         match self {
             Function::Native(_, function) => function(interpreter, arguments),
             Function::Declared(StmtFunction { params, body, .. }, closure, is_initializer) => {
@@ -1202,20 +1253,28 @@ impl Function {
                     environment.define(params[i].lexeme.clone(), arguments[i].clone())
                 }
 
-                let result = interpreter.execute_block(body, environment);
+                let result = interpreter.execute_block(interner, body, environment);
 
                 if *is_initializer {
-                    return Ok(closure.values.borrow().get("this").unwrap().clone());
+                    return Ok(closure
+                        .values
+                        .borrow()
+                        .get(&interner.sym_this)
+                        .unwrap()
+                        .clone());
                 }
 
                 result.map(|_| Value::Nil)
             }
             Function::Class(_, class) => {
                 let instance = Rc::new(Instance::new(Rc::clone(class)));
-                if let Some(Value::Callable(initializer)) = instance.find_method("init") {
-                    initializer
-                        .bind(Rc::clone(&instance))
-                        .call(interpreter, arguments)?;
+                if let Some(Value::Callable(initializer)) = instance.find_method(interner.sym_init)
+                {
+                    initializer.bind(interner, Rc::clone(&instance)).call(
+                        interpreter,
+                        interner,
+                        arguments,
+                    )?;
                 }
 
                 Ok(Value::Instance(instance))
@@ -1223,10 +1282,10 @@ impl Function {
         }
     }
 
-    fn bind(&self, instance: Rc<Instance>) -> Function {
+    fn bind(&self, interner: &Interner, instance: Rc<Instance>) -> Function {
         if let Function::Declared(stmt_function, closure, is_initializer) = self {
             let environment = Environment::new(Some(Rc::clone(closure)));
-            environment.define(String::from("this"), Value::Instance(instance));
+            environment.define(interner.sym_this, Value::Instance(instance));
             Function::Declared(stmt_function.clone(), Rc::new(environment), *is_initializer)
         } else {
             unreachable!()
@@ -1254,11 +1313,11 @@ enum ErrCause {
 }
 
 impl Interpreter {
-    fn new() -> Interpreter {
+    fn new(interner: &Interner) -> Interpreter {
         let global_environment = Rc::new(Environment::new(None));
 
         global_environment.define(
-            String::from("clock"),
+            interner.get_or_intern("clock"),
             Value::Callable(Rc::new(Function::Native(0, |_, _| {
                 if let Ok(n) = time::SystemTime::now().duration_since(time::UNIX_EPOCH) {
                     Ok(Value::Number(n.as_secs_f64()))
@@ -1279,7 +1338,7 @@ impl Interpreter {
 
     fn interpret(&mut self, app: &App, statements: &[Stmt]) {
         for statement in statements {
-            match self.execute(statement) {
+            match self.execute(&app.interner, statement) {
                 Ok(_) => {}
                 Err(ErrCause::Error(token, message)) => {
                     app.runtime_error(&token, &message);
@@ -1290,40 +1349,40 @@ impl Interpreter {
         }
     }
 
-    fn execute(&mut self, statement: &Stmt) -> Result<(), ErrCause> {
+    fn execute(&mut self, interner: &Interner, statement: &Stmt) -> Result<(), ErrCause> {
         match statement {
             Stmt::Expression(expr) => {
-                self.evaluate(expr)?;
+                self.evaluate(interner, expr)?;
             }
             Stmt::Print { expression } => {
-                let value = self.evaluate(expression)?;
-                println!("{}", stringify(&value));
+                let value = self.evaluate(interner, expression)?;
+                println!("{}", stringify(interner, &value));
             }
             Stmt::Var { name, initializer } => {
                 let value = match initializer {
-                    Some(expr) => self.evaluate(expr)?,
+                    Some(expr) => self.evaluate(interner, expr)?,
                     _ => Value::Nil,
                 };
                 self.environment.define(name.lexeme.clone(), value);
             }
             Stmt::Block { statements } => {
                 let environment = Environment::new(Some(Rc::clone(&self.environment)));
-                self.execute_block(statements, environment)?;
+                self.execute_block(interner, statements, environment)?;
             }
             Stmt::If {
                 condition,
                 then_branch,
                 else_branch,
             } => {
-                if is_truthy(&self.evaluate(condition)?) {
-                    self.execute(then_branch)?;
+                if is_truthy(&self.evaluate(interner, condition)?) {
+                    self.execute(interner, then_branch)?;
                 } else if let Some(else_branch) = else_branch {
-                    self.execute(else_branch)?;
+                    self.execute(interner, else_branch)?;
                 }
             }
             Stmt::While { condition, body } => {
-                while is_truthy(&self.evaluate(condition)?) {
-                    self.execute(body)?;
+                while is_truthy(&self.evaluate(interner, condition)?) {
+                    self.execute(interner, body)?;
                 }
             }
             Stmt::Function(function_stmt) => {
@@ -1342,7 +1401,7 @@ impl Interpreter {
                 superclass,
             } => {
                 let superclass_value = if let Some(superclass) = superclass {
-                    let value = self.evaluate(superclass)?;
+                    let value = self.evaluate(interner, superclass)?;
                     if value.to_class().is_some() {
                         Some(value)
                     } else {
@@ -1365,13 +1424,13 @@ impl Interpreter {
                     let environment = Environment::new(Some(Rc::clone(&self.environment)));
                     self.environment = Rc::new(environment);
                     self.environment
-                        .define(String::from("super"), superclass.clone())
+                        .define(interner.sym_super, superclass.clone())
                 }
 
                 let mut initializer_arity = 0;
                 let mut class_methods = HashMap::new();
                 for method in methods {
-                    let is_initializer = method.name.lexeme == "init";
+                    let is_initializer = method.name.lexeme == interner.sym_init;
                     if is_initializer {
                         initializer_arity = method.params.len();
                     }
@@ -1394,17 +1453,17 @@ impl Interpreter {
                 let class = Value::Callable(Rc::new(Function::Class(
                     initializer_arity,
                     Rc::new(Class {
-                        name: name.lexeme.clone(),
+                        name: name.lexeme,
                         methods: class_methods,
                         superclass,
                     }),
                 )));
 
-                self.environment.assign(&name, class)?;
+                self.environment.assign(interner, &name, class)?;
             }
             Stmt::Return { value, .. } => {
                 let return_value = match value {
-                    Some(value_expr) => self.evaluate(value_expr)?,
+                    Some(value_expr) => self.evaluate(interner, value_expr)?,
                     None => Value::Nil,
                 };
 
@@ -1416,6 +1475,7 @@ impl Interpreter {
 
     fn execute_block(
         &mut self,
+        interner: &Interner,
         statements: &[Stmt],
         environment: Environment,
     ) -> Result<(), ErrCause> {
@@ -1424,7 +1484,7 @@ impl Interpreter {
 
         let mut ret = Ok(());
         for statement in statements {
-            ret = self.execute(statement);
+            ret = self.execute(interner, statement);
             if ret.is_err() {
                 break;
             }
@@ -1435,15 +1495,15 @@ impl Interpreter {
         ret
     }
 
-    fn evaluate(&mut self, expr: &Expr) -> Result<Value, ErrCause> {
+    fn evaluate(&mut self, interner: &Interner, expr: &Expr) -> Result<Value, ErrCause> {
         match expr {
             Expr::Binary {
                 left,
                 operator,
                 right,
             } => {
-                let left = self.evaluate(left)?;
-                let right = self.evaluate(right)?;
+                let left = self.evaluate(interner, left)?;
+                let right = self.evaluate(interner, right)?;
 
                 match operator.token_type {
                     TokenType::Minus => {
@@ -1498,7 +1558,7 @@ impl Interpreter {
                     _ => panic!("Unexpected binary operator token."),
                 }
             }
-            Expr::Grouping { expression } => self.evaluate(expression),
+            Expr::Grouping { expression } => self.evaluate(interner, expression),
             Expr::Literal { value } => match value {
                 TokenLiteral::String(str) => Ok(Value::String(Rc::new(str.clone()))),
                 TokenLiteral::Number(num) => Ok(Value::Number(*num)),
@@ -1506,7 +1566,7 @@ impl Interpreter {
                 TokenLiteral::Nil => Ok(Value::Nil),
             },
             Expr::Unary { operator, right } => {
-                let right = self.evaluate(right)?;
+                let right = self.evaluate(interner, right)?;
 
                 match operator.token_type {
                     TokenType::Bang => Ok(Value::Bool(!is_truthy(&right))),
@@ -1517,13 +1577,20 @@ impl Interpreter {
                     _ => panic!("Unexpected unary operator token."),
                 }
             }
-            Expr::Variable(id, ExprVariable { name }) => self.look_up_variable(name, *id),
+            Expr::Variable(id, ExprVariable { name }) => self.look_up_variable(interner, name, *id),
             Expr::Assign { name, value, id } => {
-                let value = self.evaluate(value)?;
+                let value = self.evaluate(interner, value)?;
                 if let Some(distance) = self.locals.get(id).cloned() {
-                    Environment::assign_at(&self.environment, distance, &name, value.clone())?;
+                    Environment::assign_at(
+                        interner,
+                        &self.environment,
+                        distance,
+                        &name,
+                        value.clone(),
+                    )?;
                 } else {
-                    self.global_environment.assign(name, value.clone())?;
+                    self.global_environment
+                        .assign(interner, name, value.clone())?;
                 }
                 Ok(value)
             }
@@ -1532,7 +1599,7 @@ impl Interpreter {
                 operator,
                 right,
             } => {
-                let left = self.evaluate(left)?;
+                let left = self.evaluate(interner, left)?;
 
                 if operator.token_type == TokenType::Or {
                     if is_truthy(&left) {
@@ -1542,24 +1609,24 @@ impl Interpreter {
                     return Ok(left);
                 }
 
-                self.evaluate(right)
+                self.evaluate(interner, right)
             }
             Expr::Call {
                 callee,
                 paren,
                 arguments,
             } => {
-                let callee = self.evaluate(callee)?;
+                let callee = self.evaluate(interner, callee)?;
 
                 let mut argument_values = Vec::new();
                 for argument in arguments {
-                    argument_values.push(self.evaluate(argument)?);
+                    argument_values.push(self.evaluate(interner, argument)?);
                 }
 
                 if let Value::Callable(function) = callee {
                     if argument_values.len() == function.arity() {
                         let f: &Function = Rc::borrow(&function);
-                        match f.call(self, &argument_values) {
+                        match f.call(self, interner, &argument_values) {
                             Err(ErrCause::Return(value)) => Ok(value),
                             result => result,
                         }
@@ -1579,9 +1646,9 @@ impl Interpreter {
                 }
             }
             Expr::Get { object, name } => {
-                let object = self.evaluate(object)?;
+                let object = self.evaluate(interner, object)?;
                 if let Value::Instance(instance) = object {
-                    instance.get(name)
+                    instance.get(interner, name)
                 } else {
                     Err(ErrCause::Error(
                         name.clone(),
@@ -1594,10 +1661,10 @@ impl Interpreter {
                 name,
                 value,
             } => {
-                let mut object = self.evaluate(object)?;
+                let mut object = self.evaluate(interner, object)?;
 
                 if let Value::Instance(instance) = &mut object {
-                    let value = self.evaluate(value)?;
+                    let value = self.evaluate(interner, value)?;
                     instance.set(name, value.clone());
                     Ok(value)
                 } else {
@@ -1607,19 +1674,24 @@ impl Interpreter {
                     ))
                 }
             }
-            Expr::This { keyword, id } => self.look_up_variable(keyword, *id),
+            Expr::This { keyword, id } => self.look_up_variable(interner, keyword, *id),
             Expr::Super { method, id, .. } => {
                 let distance = self.locals.get(id).cloned().unwrap();
-                let superclass = Environment::get_at(&self.environment, distance, "super");
-                let object = Environment::get_at(&self.environment, distance - 1, "this");
-                let method_value = superclass.to_class().unwrap().find_method(&method.lexeme);
+                let superclass =
+                    Environment::get_at(&self.environment, distance, interner.sym_super);
+                let object =
+                    Environment::get_at(&self.environment, distance - 1, interner.sym_this);
+                let method_value = superclass.to_class().unwrap().find_method(method.lexeme);
                 match method_value {
                     Some(Value::Callable(function)) => Ok(Value::Callable(Rc::new(
-                        function.bind(object.to_instance().unwrap()),
+                        function.bind(interner, object.to_instance().unwrap()),
                     ))),
                     None => Err(ErrCause::Error(
                         method.clone(),
-                        format!("Undefined property '{}'.", method.lexeme),
+                        format!(
+                            "Undefined property '{}'.",
+                            interner.interner.borrow().resolve(method.lexeme).unwrap()
+                        ),
                     )),
                     _ => unreachable!(),
                 }
@@ -1631,16 +1703,21 @@ impl Interpreter {
         self.locals.insert(id, depth);
     }
 
-    fn look_up_variable(&mut self, name: &Token, id: ExprId) -> Result<Value, ErrCause> {
+    fn look_up_variable(
+        &mut self,
+        interner: &Interner,
+        name: &Token,
+        id: ExprId,
+    ) -> Result<Value, ErrCause> {
         let distance = self.locals.get(&id);
         if let Some(distance) = distance {
             Ok(Environment::get_at(
                 &self.environment,
                 *distance,
-                &name.lexeme,
+                name.lexeme,
             ))
         } else {
-            self.global_environment.get(name)
+            self.global_environment.get(interner, name)
         }
     }
 
@@ -1688,7 +1765,7 @@ fn is_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn stringify(value: &Value) -> String {
+fn stringify(interner: &Interner, value: &Value) -> String {
     match value {
         Value::String(str) => str.as_ref().clone(),
         Value::Number(num) => format!("{}", num),
@@ -1702,16 +1779,18 @@ fn stringify(value: &Value) -> String {
         Value::Nil => String::from("nil"),
         Value::Callable(function) => match &*Rc::borrow(function) {
             Function::Native(..) => String::from("<native fn>"),
-            Function::Declared(StmtFunction { name, .. }, ..) => format!("<fn {}>", name.lexeme),
-            Function::Class(_, class) => class.name.clone(),
+            Function::Declared(StmtFunction { name, .. }, ..) => {
+                format!("<fn {}>", interner.resolve(name.lexeme))
+            }
+            Function::Class(_, class) => interner.resolve(class.name),
         },
-        Value::Instance(instance) => format!("{} instance", instance.class.name),
+        Value::Instance(instance) => format!("{} instance", interner.resolve(instance.class.name)),
     }
 }
 
 #[derive(Clone)]
 struct Environment {
-    values: RefCell<HashMap<String, Value>>,
+    values: RefCell<HashMap<Symbol, Value>>,
     enclosing: Option<Rc<Environment>>,
 }
 
@@ -1723,11 +1802,11 @@ impl Environment {
         }
     }
 
-    fn define(&self, name: String, value: Value) {
+    fn define(&self, name: Symbol, value: Value) {
         self.values.borrow_mut().insert(name, value);
     }
 
-    fn assign(&self, name: &Token, value: Value) -> Result<(), ErrCause> {
+    fn assign(&self, interner: &Interner, name: &Token, value: Value) -> Result<(), ErrCause> {
         if self.values.borrow().get(&name.lexeme).is_some() {
             self.values.borrow_mut().insert(name.lexeme.clone(), value);
             Ok(())
@@ -1735,42 +1814,43 @@ impl Environment {
             self.enclosing.as_ref().map_or(
                 Err(ErrCause::Error(
                     name.clone(),
-                    format!("Undefined variable '{}'.", name.lexeme),
+                    format!("Undefined variable '{}'.", interner.resolve(name.lexeme)),
                 )),
-                |enclosing| enclosing.assign(name, value),
+                |enclosing| enclosing.assign(interner, name, value),
             )
         }
     }
 
-    fn get(&self, name: &Token) -> Result<Value, ErrCause> {
+    fn get(&self, interner: &Interner, name: &Token) -> Result<Value, ErrCause> {
         match self.values.borrow().get(&name.lexeme) {
             Some(value) => Ok(value.clone()),
             None => self.enclosing.as_ref().map_or(
                 Err(ErrCause::Error(
                     name.clone(),
-                    format!("Undefined variable '{}'.", name.lexeme),
+                    format!("Undefined variable '{}'.", interner.resolve(name.lexeme)),
                 )),
-                |enclosing| enclosing.get(name),
+                |enclosing| enclosing.get(interner, name),
             ),
         }
     }
 
-    fn get_at(environment: &Rc<Environment>, distance: usize, name: &str) -> Value {
+    fn get_at(environment: &Rc<Environment>, distance: usize, name: Symbol) -> Value {
         Environment::ancestor(environment, distance)
             .values
             .borrow()
-            .get(name)
+            .get(&name)
             .unwrap()
             .clone()
     }
 
     fn assign_at(
+        interner: &Interner,
         environment: &Rc<Environment>,
         distance: usize,
         name: &Token,
         value: Value,
     ) -> Result<(), ErrCause> {
-        Environment::ancestor(environment, distance).assign(name, value)
+        Environment::ancestor(environment, distance).assign(interner, name, value)
     }
 
     fn ancestor(environment: &Rc<Environment>, distance: usize) -> Rc<Environment> {
@@ -1786,7 +1866,7 @@ impl Environment {
 struct Resolver<'a> {
     app: &'a App,
     interpreter: &'a mut Interpreter,
-    scopes: Vec<HashMap<String, bool>>,
+    scopes: Vec<HashMap<Symbol, bool>>,
     current_function: FunctionType,
     current_class: ClassType,
 }
@@ -1870,15 +1950,15 @@ impl Resolver<'_> {
 
                     self.begin_scope();
                     let last = self.scopes.len() - 1;
-                    self.scopes[last].insert(String::from("super"), true);
+                    self.scopes[last].insert(self.app.interner.sym_super, true);
                 }
 
                 self.begin_scope();
                 let last = self.scopes.len() - 1;
-                self.scopes[last].insert(String::from("this"), true);
+                self.scopes[last].insert(self.app.interner.sym_this, true);
 
                 for method in methods {
-                    let declaration = if method.name.lexeme == "init" {
+                    let declaration = if method.name.lexeme == self.app.interner.sym_init {
                         FunctionType::Initializer
                     } else {
                         FunctionType::Method
@@ -2047,14 +2127,14 @@ impl Resolver<'_> {
 }
 
 struct Class {
-    name: String,
-    methods: HashMap<String, Value>,
+    name: Symbol,
+    methods: HashMap<Symbol, Value>,
     superclass: Option<Rc<Class>>,
 }
 
 impl Class {
-    fn find_method(&self, name: &str) -> Option<Value> {
-        self.methods.get(name).cloned().or_else(|| {
+    fn find_method(&self, name: Symbol) -> Option<Value> {
+        self.methods.get(&name).cloned().or_else(|| {
             self.superclass
                 .as_ref()
                 .map(|superclass| superclass.find_method(name))
@@ -2065,21 +2145,23 @@ impl Class {
 
 struct Instance {
     class: Rc<Class>,
-    fields: RefCell<HashMap<String, Value>>,
+    fields: RefCell<HashMap<Symbol, Value>>,
 }
 
 trait RcInstanceExt {
-    fn get(&self, name: &Token) -> Result<Value, ErrCause>;
+    fn get(&self, interner: &Interner, name: &Token) -> Result<Value, ErrCause>;
 }
 
 impl RcInstanceExt for Rc<Instance> {
-    fn get(&self, name: &Token) -> Result<Value, ErrCause> {
+    fn get(&self, interner: &Interner, name: &Token) -> Result<Value, ErrCause> {
         if let Some(value) = self.fields.borrow().get(&name.lexeme) {
             Ok(value.clone())
-        } else if let Some(method) = self.class.find_method(&name.lexeme) {
+        } else if let Some(method) = self.class.find_method(name.lexeme) {
             if let Value::Callable(function) = method {
                 if let Function::Declared(..) = &*Rc::borrow(&function) {
-                    Ok(Value::Callable(Rc::new(function.bind(Rc::clone(self)))))
+                    Ok(Value::Callable(Rc::new(
+                        function.bind(interner, Rc::clone(self)),
+                    )))
                 } else {
                     unreachable!()
                 }
@@ -2089,7 +2171,7 @@ impl RcInstanceExt for Rc<Instance> {
         } else {
             Err(ErrCause::Error(
                 name.clone(),
-                format!("Undefined property '{}'.", name.lexeme),
+                format!("Undefined property '{}'.", interner.resolve(name.lexeme)),
             ))
         }
     }
@@ -2103,7 +2185,7 @@ impl Instance {
         }
     }
 
-    fn find_method(&self, name: &str) -> Option<Value> {
+    fn find_method(&self, name: Symbol) -> Option<Value> {
         self.class.find_method(name)
     }
 
