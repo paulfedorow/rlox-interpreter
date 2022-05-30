@@ -28,13 +28,13 @@ interpreter (which is programmed in Java).
 
 |                     | rlox-interpreter | jlox     | rlox-interpreter/jlox |
 |---------------------|------------------|----------|-----------------------|
-| binary_trees.lox    |         20.887 s |  4.624 s |                  4.52 |
-| equality.lox        |          9.516 s |  2.849 s |                  3.34 |
-| fib.lox             |          9.577 s |  2.884 s |                  3.32 |
-| instantiation.lox   |          3.288 s |  1.126 s |                  2.92 |
-| invocation.lox      |          2.909 s |  1.034 s |                  2.81 |
-| method_call.lox     |          2.811 s |  1.258 s |                  2.23 |
-| properties.lox      |          6.081 s |  3.201 s |                  1.90 |
-| string_equality.lox |          4.403 s |  2.273 s |                  1.94 |
-| trees.lox           |         68.517 s | 22.050 s |                  3.11 |
-| zoo.lox             |          4.286 s |  3.208 s |                  1.34 |
+| binary_trees.lox    |         20.351 s |  4.624 s |                  4.40 |
+| equality.lox        |          9.636 s |  2.849 s |                  3.38 |
+| fib.lox             |          8.850 s |  2.884 s |                  3.07 |
+| instantiation.lox   |          3.226 s |  1.126 s |                  2.87 |
+| invocation.lox      |          2.938 s |  1.034 s |                  2.84 |
+| method_call.lox     |          2.634 s |  1.258 s |                  2.09 |
+| properties.lox      |          5.312 s |  3.201 s |                  1.66 |
+| string_equality.lox |          4.637 s |  2.273 s |                  2.04 |
+| trees.lox           |         65.593 s | 22.050 s |                  2.97 |
+| zoo.lox             |          3.850 s |  3.208 s |                  1.20 |

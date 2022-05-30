@@ -1214,6 +1214,18 @@ impl Value {
         }
     }
 
+    fn is_class(&self) -> bool {
+        if let Value::Callable(function) = self {
+            if let Function::Class(..) = Rc::borrow(function) {
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
     fn to_class(&self) -> Option<Rc<Class>> {
         match self {
             Value::Callable(function) => {
@@ -1402,7 +1414,7 @@ impl Interpreter {
             } => {
                 let superclass_value = if let Some(superclass) = superclass {
                     let value = self.evaluate(interner, superclass)?;
-                    if value.to_class().is_some() {
+                    if value.is_class() {
                         Some(value)
                     } else {
                         if let Expr::Variable(_, superclass) = superclass {
@@ -1420,12 +1432,13 @@ impl Interpreter {
 
                 self.environment.define(name.lexeme.clone(), Value::Nil);
 
-                if let Some(superclass) = &superclass_value {
-                    let environment = Environment::new(Some(Rc::clone(&self.environment)));
-                    self.environment = Rc::new(environment);
-                    self.environment
-                        .define(interner.sym_super, superclass.clone())
-                }
+                let environment = if let Some(superclass) = &superclass_value {
+                    let environment = Rc::new(Environment::new(Some(Rc::clone(&self.environment))));
+                    environment.define(interner.sym_super, superclass.clone());
+                    environment
+                } else {
+                    Rc::clone(&self.environment)
+                };
 
                 let mut initializer_arity = 0;
                 let mut class_methods = HashMap::new();
@@ -1436,14 +1449,10 @@ impl Interpreter {
                     }
                     let function = Value::Callable(Rc::new(Function::Declared(
                         method.clone(),
-                        Rc::clone(&self.environment),
+                        Rc::clone(&environment),
                         is_initializer,
                     )));
                     class_methods.insert(method.name.lexeme.clone(), function);
-                }
-
-                if superclass_value.is_some() {
-                    self.environment = Rc::clone(&self.environment.enclosing.as_ref().unwrap());
                 }
 
                 let superclass = superclass_value
@@ -1479,8 +1488,7 @@ impl Interpreter {
         statements: &[Stmt],
         environment: Environment,
     ) -> Result<(), ErrCause> {
-        let previous = Rc::clone(&self.environment);
-        self.environment = Rc::new(environment);
+        let previous = std::mem::replace(&mut self.environment, Rc::new(environment));
 
         let mut ret = Ok(());
         for statement in statements {
@@ -1681,7 +1689,15 @@ impl Interpreter {
                     Environment::get_at(&self.environment, distance, interner.sym_super);
                 let object =
                     Environment::get_at(&self.environment, distance - 1, interner.sym_this);
-                let method_value = superclass.to_class().unwrap().find_method(method.lexeme);
+                let method_value = if let Value::Callable(function) = superclass {
+                    if let Function::Class(_, class) = Rc::borrow(&function) {
+                        class.find_method(method.lexeme)
+                    } else {
+                        unreachable!()
+                    }
+                } else {
+                    unreachable!()
+                };
                 match method_value {
                     Some(Value::Callable(function)) => Ok(Value::Callable(Rc::new(
                         function.bind(interner, object.to_instance().unwrap()),
@@ -1794,6 +1810,16 @@ struct Environment {
     enclosing: Option<Rc<Environment>>,
 }
 
+macro_rules! env_ancestor {
+    ($init:expr, $distance:expr) => {{
+        let mut env = $init;
+        for _ in 0..$distance {
+            env = env.enclosing.as_ref().unwrap();
+        }
+        env
+    }};
+}
+
 impl Environment {
     fn new(enclosing: Option<Rc<Environment>>) -> Environment {
         Environment {
@@ -1835,7 +1861,7 @@ impl Environment {
     }
 
     fn get_at(environment: &Rc<Environment>, distance: usize, name: Symbol) -> Value {
-        Environment::ancestor(environment, distance)
+        env_ancestor!(environment, distance)
             .values
             .borrow()
             .get(&name)
@@ -1850,16 +1876,7 @@ impl Environment {
         name: &Token,
         value: Value,
     ) -> Result<(), ErrCause> {
-        Environment::ancestor(environment, distance).assign(interner, name, value)
-    }
-
-    fn ancestor(environment: &Rc<Environment>, distance: usize) -> Rc<Environment> {
-        let mut env = Rc::clone(environment);
-        for _ in 0..distance {
-            let enclosing = Rc::clone(env.enclosing.as_ref().unwrap());
-            env = enclosing;
-        }
-        env
+        env_ancestor!(environment, distance).assign(interner, name, value)
     }
 }
 
