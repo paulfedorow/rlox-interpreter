@@ -1,0 +1,4 @@
+Foo.init(one)
+Foo.init(two)
+Foo instance
+init

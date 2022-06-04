@@ -18,7 +18,7 @@ Start a repl:
 
 Execute a Lox script:
 
-    target/release/rlox-interpreter examples/class.lox
+    target/release/rlox-interpreter resources/benchmark/fib.lox
 
 ## Benchmarks
 

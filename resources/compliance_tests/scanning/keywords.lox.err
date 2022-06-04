@@ -1,0 +1,6 @@
+[line 1] Error at 'and': Expect expression.
+[line 1] Error at 'else': Expect class name.
+[line 1] Error at 'fun': Expect '(' after 'for'.
+[line 1] Error at 'nil': Expect '(' after 'if'.
+[line 1] Error at 'this': Expect '.' after 'super'.
+[line 1] Error at 'while': Expect variable name.

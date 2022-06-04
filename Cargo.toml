@@ -7,3 +7,6 @@ edition = "2021"
 
 [dependencies]
 string-interner = "0.14.0"
+
+[dev-dependencies]
+walkdir = "2"

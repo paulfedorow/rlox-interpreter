@@ -2217,3 +2217,42 @@ impl Instance {
         self.fields.borrow_mut().insert(name.lexeme.clone(), value);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use walkdir::WalkDir;
+    use super::*;
+
+    #[test]
+    fn test_compliance() {
+        let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let mut exe_path = root_dir.clone();
+        exe_path.push(format!("target/debug/rlox-interpreter{}", std::env::consts::EXE_SUFFIX));
+
+        assert!(exe_path.exists(), "rlox-interpreter executable not found. Run cargo build first.");
+
+        let mut resources_dir = root_dir.clone();
+        resources_dir.push("resources/compliance_tests");
+
+        for lox_file in WalkDir::new(resources_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_str().map(|s| s.ends_with(".lox")).unwrap_or(false)) {
+
+            let output = std::process::Command::new(exe_path.clone())
+                .args([lox_file.path()])
+                .output()
+                .unwrap();
+
+            let lox_file_path = lox_file.path().to_str().unwrap();
+
+            let expected_out = fs::read_to_string(String::from(lox_file_path) + ".out").unwrap();
+            let expected_err = fs::read_to_string(String::from(lox_file_path) + ".err").unwrap();
+
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected_out);
+            assert_eq!(String::from_utf8(output.stderr).unwrap(), expected_err);
+        }
+    }
+}
