@@ -1,10 +1,10 @@
 use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::{env, fs, io, str, time};
+use fnv::FnvHashMap;
 use string_interner::backend::StringBackend;
 use string_interner::symbol::SymbolU32;
 use string_interner::StringInterner;
@@ -1321,7 +1321,7 @@ impl Function {
 struct Interpreter {
     global_environment: Rc<Environment>,
     environment: Rc<Environment>,
-    locals: HashMap<ExprId, usize>,
+    locals: FnvHashMap<ExprId, usize>,
 }
 
 enum ErrCause {
@@ -1349,7 +1349,7 @@ impl Interpreter {
         Interpreter {
             global_environment,
             environment,
-            locals: HashMap::new(),
+            locals: FnvHashMap::default(),
         }
     }
 
@@ -1444,7 +1444,7 @@ impl Interpreter {
                 };
 
                 let mut initializer_arity = None;
-                let mut class_methods = HashMap::new();
+                let mut class_methods = FnvHashMap::default();
                 for method in methods {
                     let is_initializer = method.name.lexeme == interner.sym_init;
                     if is_initializer {
@@ -1828,7 +1828,7 @@ fn stringify(interner: &Interner, value: &Value) -> String {
 
 #[derive(Clone)]
 struct Environment {
-    values: RefCell<HashMap<Symbol, Value>>,
+    values: RefCell<FnvHashMap<Symbol, Value>>,
     enclosing: Option<Rc<Environment>>,
 }
 
@@ -1845,7 +1845,7 @@ macro_rules! env_ancestor {
 impl Environment {
     fn new(enclosing: Option<Rc<Environment>>) -> Environment {
         Environment {
-            values: RefCell::new(HashMap::new()),
+            values: RefCell::new(FnvHashMap::default()),
             enclosing,
         }
     }
@@ -1905,7 +1905,7 @@ impl Environment {
 struct Resolver<'a> {
     app: &'a App,
     interpreter: &'a mut Interpreter,
-    scopes: Vec<HashMap<Symbol, bool>>,
+    scopes: Vec<FnvHashMap<Symbol, bool>>,
     current_function: FunctionType,
     current_class: ClassType,
 }
@@ -2157,7 +2157,7 @@ impl Resolver<'_> {
     }
 
     fn begin_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(FnvHashMap::default());
     }
 
     fn end_scope(&mut self) {
@@ -2167,7 +2167,7 @@ impl Resolver<'_> {
 
 struct Class {
     name: Symbol,
-    methods: HashMap<Symbol, Value>,
+    methods: FnvHashMap<Symbol, Value>,
     superclass: Option<Rc<Class>>,
 }
 
@@ -2182,7 +2182,7 @@ impl Class {
 
 struct Instance {
     class: Rc<Class>,
-    fields: RefCell<HashMap<Symbol, Value>>,
+    fields: RefCell<FnvHashMap<Symbol, Value>>,
 }
 
 trait RcInstanceExt {
@@ -2218,7 +2218,7 @@ impl Instance {
     fn new(class: Rc<Class>) -> Instance {
         Instance {
             class,
-            fields: RefCell::new(HashMap::new()),
+            fields: RefCell::new(FnvHashMap::default()),
         }
     }
 
