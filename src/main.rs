@@ -353,7 +353,9 @@ impl Scanner<'_> {
         let value = &self.source[(self.start + 1)..(self.current - 1)];
         self.add_token_with_literal(
             TokenType::String,
-            TokenLiteral::String(String::from(str::from_utf8(value).unwrap())),
+            TokenLiteral::String(
+                self.app.interner.get_or_intern(str::from_utf8(value).unwrap())
+            ),
         );
     }
 
@@ -452,7 +454,7 @@ struct Token {
 
 #[derive(Debug, Clone)]
 enum TokenLiteral {
-    String(String),
+    String(Symbol),
     Number(f64),
     Bool(bool),
     Nil,
@@ -1202,6 +1204,7 @@ impl Parser<'_> {
 #[derive(Clone)]
 enum Value {
     String(Rc<String>),
+    InternedString(Symbol),
     Number(f64),
     Bool(bool),
     Callable(Rc<Function>),
@@ -1555,6 +1558,15 @@ impl Interpreter {
                         (Value::String(left_str), Value::String(right_str)) => {
                             Ok(Value::String(Rc::from((&*left_str).clone() + &*right_str)))
                         }
+                        (Value::InternedString(left_str), Value::String(right_str)) => {
+                            Ok(Value::String(Rc::from(interner.resolve(left_str) + &*right_str)))
+                        }
+                        (Value::String(left_str), Value::InternedString(right_str)) => {
+                            Ok(Value::String(Rc::from((&*left_str).clone() + &interner.resolve(right_str))))
+                        }
+                        (Value::InternedString(left_str), Value::InternedString(right_str)) => {
+                            Ok(Value::String(Rc::from(interner.resolve(left_str) + &interner.resolve(right_str))))
+                        }
                         _ => Err(ErrCause::Error(
                             operator.clone(),
                             String::from("Operands must be two numbers or two strings."),
@@ -1580,14 +1592,14 @@ impl Interpreter {
                             self.check_number_operands(operator, &left, &right)?;
                         Ok(Value::Bool(left_num <= right_num))
                     }
-                    TokenType::BangEqual => Ok(Value::Bool(!is_equal(&left, &right))),
-                    TokenType::EqualEqual => Ok(Value::Bool(is_equal(&left, &right))),
+                    TokenType::BangEqual => Ok(Value::Bool(!is_equal(&left, &right, interner))),
+                    TokenType::EqualEqual => Ok(Value::Bool(is_equal(&left, &right, interner))),
                     _ => panic!("Unexpected binary operator token."),
                 }
             }
             Expr::Grouping { expression } => self.evaluate(interner, expression),
             Expr::Literal { value } => match value {
-                TokenLiteral::String(str) => Ok(Value::String(Rc::new(str.clone()))),
+                TokenLiteral::String(sym) => Ok(Value::InternedString(*sym)),
                 TokenLiteral::Number(num) => Ok(Value::Number(*num)),
                 TokenLiteral::Bool(bool) => Ok(Value::Bool(*bool)),
                 TokenLiteral::Nil => Ok(Value::Nil),
@@ -1790,9 +1802,12 @@ fn is_truthy(value: &Value) -> bool {
     }
 }
 
-fn is_equal(left: &Value, right: &Value) -> bool {
+fn is_equal(left: &Value, right: &Value, interner: &Interner) -> bool {
     match (left, right) {
-        (Value::String(l), Value::String(r)) => l == r,
+        (Value::String(l), Value::String(r)) => Rc::ptr_eq(l, r),
+        (Value::InternedString(l), Value::String(r)) => interner.resolve(*l) == **r,
+        (Value::String(l), Value::InternedString(r)) => **l == interner.resolve(*r),
+        (Value::InternedString(l), Value::InternedString(r)) => l == r,
         (Value::Number(l), Value::Number(r)) => l == r,
         (Value::Bool(l), Value::Bool(r)) => l == r,
         (Value::Nil, Value::Nil) => true,
@@ -1805,6 +1820,7 @@ fn is_equal(left: &Value, right: &Value) -> bool {
 fn stringify(interner: &Interner, value: &Value) -> String {
     match value {
         Value::String(str) => str.as_ref().clone(),
+        Value::InternedString(sym) => interner.resolve(*sym),
         Value::Number(num) => format!("{}", num),
         Value::Bool(b) => {
             if *b {
