@@ -1449,12 +1449,12 @@ impl Interpreter {
                     Rc::clone(&self.environment)
                 };
 
-                let mut initializer_arity = 0;
+                let mut initializer_arity = None;
                 let mut class_methods = HashMap::new();
                 for method in methods {
                     let is_initializer = method.name.lexeme == interner.sym_init;
                     if is_initializer {
-                        initializer_arity = method.params.len();
+                        initializer_arity = Some(method.params.len());
                     }
                     let function = Value::Callable(Rc::new(Function::Declared(
                         method.clone(),
@@ -1467,6 +1467,24 @@ impl Interpreter {
                 let superclass = superclass_value
                     .map(|superclass| superclass.to_class())
                     .flatten();
+
+                let initializer_arity = initializer_arity
+                    .or_else(|| {
+                        superclass.as_ref().map(|superclass| {
+                            superclass.find_method(interner.sym_init).map(|init| {
+                                if let Value::Callable(function) = init {
+                                    if let Function::Declared(stmt_function, ..) = Rc::borrow(&function) {
+                                        Some(stmt_function.params.len())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            }).flatten()
+                        }).flatten()
+                    })
+                    .unwrap_or(0);
 
                 let class = Value::Callable(Rc::new(Function::Class(
                     initializer_arity,
@@ -1649,7 +1667,7 @@ impl Interpreter {
                         }
                     } else {
                         let message = format!(
-                            "Expected {} arguments but got {} .",
+                            "Expected {} arguments but got {}.",
                             function.arity(),
                             argument_values.len()
                         );
