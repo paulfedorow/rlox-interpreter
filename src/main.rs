@@ -1784,7 +1784,7 @@ impl Interpreter {
             (Value::Number(left_num), Value::Number(right_num)) => Ok((*left_num, *right_num)),
             _ => Err(ErrCause::Error(
                 operator.clone(),
-                String::from("Operands must be a number."),
+                String::from("Operands must be numbers."),
             )),
         }
     }
@@ -2150,7 +2150,7 @@ impl Resolver<'_> {
         if let Some(scope) = self.scopes.last_mut() {
             if scope.contains_key(&name.lexeme) {
                 self.app
-                    .error_token(name, "Already a variable with this name in in this scope.")
+                    .error_token(name, "Already a variable with this name in this scope.")
             }
             scope.insert(name.lexeme.clone(), false);
         }
@@ -2272,8 +2272,19 @@ mod tests {
             let expected_out = fs::read_to_string(String::from(lox_file_path) + ".out").unwrap();
             let expected_err = fs::read_to_string(String::from(lox_file_path) + ".err").unwrap();
 
-            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected_out);
-            assert_eq!(String::from_utf8(output.stderr).unwrap(), expected_err);
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                expected_out,
+                "Unexpected stdin-output for {}.",
+                lox_file_path
+            );
+
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                expected_err,
+                "Unexpected stderr-output for {}.",
+                lox_file_path
+            );
         }
     }
 }
