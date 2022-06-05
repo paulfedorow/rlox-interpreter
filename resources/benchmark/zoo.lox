@@ -28,4 +28,5 @@ while (sum < 10000000) {
 }
 
 print sum;
+print "elapsed:";
 print clock() - start;

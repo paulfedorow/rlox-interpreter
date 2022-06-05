@@ -40,4 +40,5 @@ while (i < 500000) {
   i = i + 1;
 }
 
+print "elapsed:";
 print clock() - start;
