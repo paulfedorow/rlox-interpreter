@@ -342,7 +342,8 @@ impl Scanner<'_> {
         }
 
         if self.is_at_end() {
-            self.app.error(self.line, "Unterminated string.")
+            self.app.error(self.line, "Unterminated string.");
+            return;
         }
 
         // The closing ".
