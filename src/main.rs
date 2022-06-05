@@ -1804,6 +1804,8 @@ fn is_equal(left: &Value, right: &Value) -> bool {
         (Value::Number(l), Value::Number(r)) => l == r,
         (Value::Bool(l), Value::Bool(r)) => l == r,
         (Value::Nil, Value::Nil) => true,
+        (Value::Instance(l), Value::Instance(r)) => Rc::ptr_eq(l, r),
+        (Value::Callable(l), Value::Callable(r)) => Rc::ptr_eq(l, r),
         (_, _) => false,
     }
 }
