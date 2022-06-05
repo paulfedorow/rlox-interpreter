@@ -1116,7 +1116,7 @@ impl Parser<'_> {
 
         let mut initializer = None;
         if self.match_one_of([TokenType::Equal]) {
-            initializer = self.expression();
+            initializer = Some(self.expression()?);
         }
 
         self.consume(
