@@ -38,3 +38,5 @@ interpreter (which is programmed in Java).
 | string_equality.lox |          4.699 s |  2.273 s |                  2.07 |
 | trees.lox           |         20.150 s | 22.050 s |                  0.91 |
 | zoo.lox             |          3.099 s |  3.208 s |                  0.97 |
+
+You can find the benchmark scripts [here](resources/benchmark).
