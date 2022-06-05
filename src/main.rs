@@ -615,8 +615,8 @@ impl Parser<'_> {
         let expr = self.or()?;
 
         if self.match_one_of([TokenType::Equal]) {
-            let value = self.assignment()?;
             let equals = self.previous_token().clone();
+            let value = self.assignment()?;
 
             return match expr {
                 Expr::Variable(_, ExprVariable { name }) => Some(Expr::Assign {
