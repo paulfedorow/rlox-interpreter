@@ -908,7 +908,9 @@ impl Parser<'_> {
         let mut statements = Vec::new();
 
         while !self.check_token(TokenType::RightBrace) && !self.is_at_end() {
-            statements.push(self.declaration()?);
+            if let Some(declaration) = self.declaration() {
+                statements.push(declaration);
+            }
         }
 
         self.consume(TokenType::RightBrace, "Expect '}' after block.")?;
@@ -1022,7 +1024,7 @@ impl Parser<'_> {
     }
 
     fn declaration(&mut self) -> Option<Stmt> {
-        if self.match_one_of([TokenType::Class]) {
+        let declaration = if self.match_one_of([TokenType::Class]) {
             self.class_declaration()
         } else if self.match_one_of([TokenType::Fun]) {
             self.function("function")
@@ -1030,14 +1032,14 @@ impl Parser<'_> {
         } else if self.match_one_of([TokenType::Var]) {
             self.var_declaration()
         } else {
-            match self.statement() {
-                statement @ Some(_) => statement,
-                None => {
-                    self.synchronize();
-                    None
-                }
-            }
+            self.statement()
+        };
+
+        if declaration.is_none() {
+            self.synchronize()
         }
+
+        declaration
     }
 
     fn class_declaration(&mut self) -> Option<Stmt> {
