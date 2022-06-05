@@ -869,7 +869,7 @@ impl Parser<'_> {
     fn gen_expr_id(&mut self) -> ExprId {
         let id = ExprId(self.expr_id_count);
         self.expr_id_count += 1;
-        return id;
+        id
     }
 
     fn parse(&mut self) -> Vec<Stmt> {
@@ -1219,11 +1219,7 @@ impl Value {
 
     fn is_class(&self) -> bool {
         if let Value::Callable(function) = self {
-            if let Function::Class(..) = Rc::borrow(function) {
-                true
-            } else {
-                false
-            }
+            matches!(Rc::borrow(function), Function::Class(..))
         } else {
             false
         }
@@ -1267,7 +1263,7 @@ impl Function {
                 let environment = Environment::new(Some(Rc::clone(closure)));
 
                 for i in 0..params.len() {
-                    environment.define(params[i].lexeme.clone(), arguments[i].clone())
+                    environment.define(params[i].lexeme, arguments[i].clone())
                 }
 
                 let result = interpreter.execute_block(interner, body, environment);
@@ -1384,7 +1380,7 @@ impl Interpreter {
                     Some(expr) => self.evaluate(interner, expr)?,
                     _ => Value::Nil,
                 };
-                self.environment.define(name.lexeme.clone(), value);
+                self.environment.define(name.lexeme, value);
             }
             Stmt::Block { statements } => {
                 let environment = Environment::new(Some(Rc::clone(&self.environment)));
@@ -1414,7 +1410,7 @@ impl Interpreter {
                 )));
 
                 self.environment
-                    .define(function_stmt.name.lexeme.clone(), function);
+                    .define(function_stmt.name.lexeme, function);
             }
             Stmt::Class {
                 name,
@@ -1425,21 +1421,19 @@ impl Interpreter {
                     let value = self.evaluate(interner, superclass)?;
                     if value.is_class() {
                         Some(value)
+                    } else if let Expr::Variable(_, superclass) = superclass {
+                        return Err(ErrCause::Error(
+                            superclass.name.clone(),
+                            String::from("Superclass must be a class."),
+                        ));
                     } else {
-                        if let Expr::Variable(_, superclass) = superclass {
-                            return Err(ErrCause::Error(
-                                superclass.name.clone(),
-                                String::from("Superclass must be a class."),
-                            ));
-                        } else {
-                            unreachable!();
-                        }
+                        unreachable!();
                     }
                 } else {
                     None
                 };
 
-                self.environment.define(name.lexeme.clone(), Value::Nil);
+                self.environment.define(name.lexeme, Value::Nil);
 
                 let environment = if let Some(superclass) = &superclass_value {
                     let environment = Rc::new(Environment::new(Some(Rc::clone(&self.environment))));
@@ -1461,17 +1455,15 @@ impl Interpreter {
                         Rc::clone(&environment),
                         is_initializer,
                     )));
-                    class_methods.insert(method.name.lexeme.clone(), function);
+                    class_methods.insert(method.name.lexeme, function);
                 }
 
-                let superclass = superclass_value
-                    .map(|superclass| superclass.to_class())
-                    .flatten();
+                let superclass = superclass_value.and_then(|superclass| superclass.to_class());
 
                 let initializer_arity = initializer_arity
                     .or_else(|| {
-                        superclass.as_ref().map(|superclass| {
-                            superclass.find_method(interner.sym_init).map(|init| {
+                        superclass.as_ref().and_then(|superclass| {
+                            superclass.find_method(interner.sym_init).and_then(|init| {
                                 if let Value::Callable(function) = init {
                                     if let Function::Declared(stmt_function, ..) = Rc::borrow(&function) {
                                         Some(stmt_function.params.len())
@@ -1481,8 +1473,8 @@ impl Interpreter {
                                 } else {
                                     None
                                 }
-                            }).flatten()
-                        }).flatten()
+                            })
+                        })
                     })
                     .unwrap_or(0);
 
@@ -1495,7 +1487,7 @@ impl Interpreter {
                     }),
                 )));
 
-                self.environment.assign(interner, &name, class)?;
+                self.environment.assign(interner, name, class)?;
             }
             Stmt::Return { value, .. } => {
                 let return_value = match value {
@@ -1620,7 +1612,7 @@ impl Interpreter {
                         interner,
                         &self.environment,
                         distance,
-                        &name,
+                        name,
                         value.clone(),
                     )?;
                 } else {
@@ -1864,7 +1856,7 @@ impl Environment {
 
     fn assign(&self, interner: &Interner, name: &Token, value: Value) -> Result<(), ErrCause> {
         if self.values.borrow().get(&name.lexeme).is_some() {
-            self.values.borrow_mut().insert(name.lexeme.clone(), value);
+            self.values.borrow_mut().insert(name.lexeme, value);
             Ok(())
         } else {
             self.enclosing.as_ref().map_or(
@@ -1962,7 +1954,7 @@ impl Resolver<'_> {
                 self.declare(&function.name);
                 self.define(&function.name);
 
-                self.resolve_function(&function, FunctionType::Function);
+                self.resolve_function(function, FunctionType::Function);
             }
             Stmt::Class {
                 name,
@@ -2010,7 +2002,7 @@ impl Resolver<'_> {
                     } else {
                         FunctionType::Method
                     };
-                    self.resolve_function(&method, declaration);
+                    self.resolve_function(method, declaration);
                 }
 
                 self.end_scope();
@@ -2028,7 +2020,7 @@ impl Resolver<'_> {
             } => {
                 self.resolve_expr(condition);
                 self.resolve_stmt(then_branch);
-                else_branch.as_ref().map(|stmt| self.resolve_stmt(stmt));
+                if let Some(stmt) = else_branch.as_ref() { self.resolve_stmt(stmt) }
             }
             Stmt::Print { expression } => self.resolve_expr(expression),
             Stmt::Return { keyword, value } => {
@@ -2037,14 +2029,14 @@ impl Resolver<'_> {
                         .error_token(keyword, "Can't return from top-level code.")
                 }
 
-                value.as_ref().map(|expr| {
+                if let Some(expr) = value.as_ref() {
                     if self.current_function == FunctionType::Initializer {
                         self.app
                             .error_token(keyword, "Can't return a value from an initializer.")
                     }
 
                     self.resolve_expr(expr)
-                });
+                }
             }
             Stmt::Var { name, initializer } => {
                 self.declare(name);
@@ -2066,8 +2058,8 @@ impl Resolver<'_> {
 
         self.begin_scope();
         for param in &stmt_function.params {
-            self.declare(&param);
-            self.define(&param);
+            self.declare(param);
+            self.define(param);
         }
         self.resolve(&stmt_function.body);
         self.end_scope();
@@ -2079,7 +2071,7 @@ impl Resolver<'_> {
         match expr {
             Expr::Assign { name, value, id } => {
                 self.resolve_expr(value);
-                self.resolve_local(*id, &name);
+                self.resolve_local(*id, name);
             }
             Expr::Binary { left, right, .. } => {
                 self.resolve_expr(left);
@@ -2154,13 +2146,13 @@ impl Resolver<'_> {
                 self.app
                     .error_token(name, "Already a variable with this name in this scope.")
             }
-            scope.insert(name.lexeme.clone(), false);
+            scope.insert(name.lexeme, false);
         }
     }
 
     fn define(&mut self, name: &Token) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.lexeme.clone(), true);
+            scope.insert(name.lexeme, true);
         }
     }
 
@@ -2183,9 +2175,7 @@ impl Class {
     fn find_method(&self, name: Symbol) -> Option<Value> {
         self.methods.get(&name).cloned().or_else(|| {
             self.superclass
-                .as_ref()
-                .map(|superclass| superclass.find_method(name))
-                .flatten()
+                .as_ref().and_then(|superclass| superclass.find_method(name))
         })
     }
 }
@@ -2237,7 +2227,7 @@ impl Instance {
     }
 
     fn set(&self, name: &Token, value: Value) {
-        self.fields.borrow_mut().insert(name.lexeme.clone(), value);
+        self.fields.borrow_mut().insert(name.lexeme, value);
     }
 }
 
@@ -2256,7 +2246,7 @@ mod tests {
 
         assert!(exe_path.exists(), "rlox-interpreter executable not found. Run cargo build first.");
 
-        let mut resources_dir = root_dir.clone();
+        let mut resources_dir = root_dir;
         resources_dir.push("resources/compliance_tests");
 
         for lox_file in WalkDir::new(resources_dir)
