@@ -28,15 +28,15 @@ interpreter (which is programmed in Java).
 
 |                     | rlox-interpreter | jlox     | rlox-interpreter/jlox |
 |---------------------|------------------|----------|-----------------------|
-| binary_trees.lox    |          6.679 s |  4.624 s |                  1.44 |
-| equality.lox        |          7.357 s |  2.849 s |                  2.58 |
-| fib.lox             |          6.133 s |  2.884 s |                  2.13 |
-| instantiation.lox   |          2.312 s |  1.126 s |                  2.05 |
-| invocation.lox      |          2.146 s |  1.034 s |                  2.08 |
-| method_call.lox     |          1.150 s |  1.258 s |                  0.91 |
-| properties.lox      |          3.011 s |  3.201 s |                  0.94 |
-| string_equality.lox |          2.656 s |  2.273 s |                  1.17 |
-| trees.lox           |         15.053 s | 22.050 s |                  0.68 |
-| zoo.lox             |          2.138 s |  3.208 s |                  0.67 |
+| binary_trees.lox    |          6.115 s |  4.624 s |                  1.32 |
+| equality.lox        |          7.230 s |  2.849 s |                  2.54 |
+| fib.lox             |          5.743 s |  2.884 s |                  1.99 |
+| instantiation.lox   |          2.220 s |  1.126 s |                  1.97 |
+| invocation.lox      |          2.056 s |  1.034 s |                  1.99 |
+| method_call.lox     |          1.025 s |  1.258 s |                  0.81 |
+| properties.lox      |          2.813 s |  3.201 s |                  0.88 |
+| string_equality.lox |          2.208 s |  2.273 s |                  0.97 |
+| trees.lox           |         14.571 s | 22.050 s |                  0.66 |
+| zoo.lox             |          2.004 s |  3.208 s |                  0.62 |
 
 You can find the benchmark scripts [here](resources/benchmark).

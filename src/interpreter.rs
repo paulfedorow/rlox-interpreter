@@ -2,7 +2,7 @@ use crate::ast::{Expr, ExprId, ExprVariable, Stmt, StmtFunction};
 use crate::interner::{Interner, Symbol};
 use crate::scanner::{Token, TokenLiteral, TokenType};
 use crate::App;
-use fnv::FnvHashMap;
+use rustc_hash::FxHashMap;
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,7 +11,7 @@ use std::time;
 pub struct Interpreter {
     global_environment: Rc<Environment>,
     environment: Rc<Environment>,
-    locals: FnvHashMap<ExprId, usize>,
+    locals: FxHashMap<ExprId, usize>,
 }
 
 impl Interpreter {
@@ -34,7 +34,7 @@ impl Interpreter {
         Interpreter {
             global_environment,
             environment,
-            locals: FnvHashMap::default(),
+            locals: FxHashMap::default(),
         }
     }
 
@@ -128,7 +128,7 @@ impl Interpreter {
                 };
 
                 let mut initializer_arity = None;
-                let mut class_methods = FnvHashMap::default();
+                let mut class_methods = FxHashMap::default();
                 for method in methods {
                     let is_initializer = method.name.lexeme == interner.sym_init;
                     if is_initializer {
@@ -481,7 +481,7 @@ impl Interpreter {
 pub struct Resolver<'a> {
     app: &'a App,
     interpreter: &'a mut Interpreter,
-    scopes: Vec<FnvHashMap<Symbol, bool>>,
+    scopes: Vec<FxHashMap<Symbol, bool>>,
     current_function: FunctionType,
     current_class: ClassType,
 }
@@ -720,7 +720,7 @@ impl Resolver<'_> {
     }
 
     fn begin_scope(&mut self) {
-        self.scopes.push(FnvHashMap::default());
+        self.scopes.push(FxHashMap::default());
     }
 
     fn end_scope(&mut self) {
@@ -905,7 +905,7 @@ fn stringify(interner: &Interner, value: &Value) -> String {
 
 #[derive(Clone)]
 struct Environment {
-    values: RefCell<FnvHashMap<Symbol, Value>>,
+    values: RefCell<FxHashMap<Symbol, Value>>,
     enclosing: Option<Rc<Environment>>,
 }
 
@@ -922,7 +922,7 @@ macro_rules! env_ancestor {
 impl Environment {
     fn new(enclosing: Option<Rc<Environment>>) -> Environment {
         Environment {
-            values: RefCell::new(FnvHashMap::default()),
+            values: RefCell::new(FxHashMap::default()),
             enclosing,
         }
     }
@@ -996,7 +996,7 @@ enum ClassType {
 
 struct Class {
     name: Symbol,
-    methods: FnvHashMap<Symbol, Value>,
+    methods: FxHashMap<Symbol, Value>,
     superclass: Option<Rc<Class>>,
 }
 
@@ -1012,7 +1012,7 @@ impl Class {
 
 struct Instance {
     class: Rc<Class>,
-    fields: RefCell<FnvHashMap<Symbol, Value>>,
+    fields: RefCell<FxHashMap<Symbol, Value>>,
 }
 
 trait RcInstanceExt {
@@ -1048,7 +1048,7 @@ impl Instance {
     fn new(class: Rc<Class>) -> Instance {
         Instance {
             class,
-            fields: RefCell::new(FnvHashMap::default()),
+            fields: RefCell::new(FxHashMap::default()),
         }
     }
 
