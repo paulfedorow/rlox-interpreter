@@ -7,7 +7,7 @@ pub struct Parser<'a> {
     tokens: Vec<Token>,
     current: usize,
     app: &'a App,
-    expr_id_count: u64,
+    expr_id_count: usize,
 }
 
 impl Parser<'_> {

@@ -66,7 +66,7 @@ pub enum Expr {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct ExprId(pub u64);
+pub struct ExprId(pub usize);
 
 #[derive(Clone, Debug)]
 pub struct ExprVariable {

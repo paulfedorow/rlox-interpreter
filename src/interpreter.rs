@@ -7,11 +7,12 @@ use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time;
+use vec_map::VecMap;
 
 pub struct Interpreter {
     global_environment: Rc<Environment>,
     environment: Rc<Environment>,
-    locals: FxHashMap<ExprId, usize>,
+    locals: VecMap<usize>,
 }
 
 impl Interpreter {
@@ -34,7 +35,7 @@ impl Interpreter {
         Interpreter {
             global_environment,
             environment,
-            locals: FxHashMap::default(),
+            locals: VecMap::default(),
         }
     }
 
@@ -306,7 +307,7 @@ impl Interpreter {
             Expr::Variable(id, ExprVariable { name }) => self.look_up_variable(interner, name, *id),
             Expr::Assign { name, value, id } => {
                 let value = self.evaluate(interner, value)?;
-                if let Some(distance) = self.locals.get(id).cloned() {
+                if let Some(distance) = self.locals.get(id.0).cloned() {
                     Environment::assign_at(
                         interner,
                         &self.environment,
@@ -402,7 +403,7 @@ impl Interpreter {
             }
             Expr::This { keyword, id } => self.look_up_variable(interner, keyword, *id),
             Expr::Super { method, id, .. } => {
-                let distance = self.locals.get(id).cloned().unwrap();
+                let distance = self.locals.get(id.0).cloned().unwrap();
                 let superclass =
                     Environment::get_at(&self.environment, distance, interner.sym_super);
                 let object =
@@ -431,7 +432,7 @@ impl Interpreter {
     }
 
     fn resolve(&mut self, id: ExprId, depth: usize) {
-        self.locals.insert(id, depth);
+        self.locals.insert(id.0, depth);
     }
 
     fn look_up_variable(
@@ -440,7 +441,7 @@ impl Interpreter {
         name: &Token,
         id: ExprId,
     ) -> Result<Value, ErrCause> {
-        let distance = self.locals.get(&id);
+        let distance = self.locals.get(id.0);
         if let Some(distance) = distance {
             Ok(Environment::get_at(
                 &self.environment,

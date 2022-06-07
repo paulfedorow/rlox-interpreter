@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 string-interner = "0.14.0"
 rustc-hash = "1.1.0"
+vec_map = "0.8.2"
 
 [dev-dependencies]
 walkdir = "2"
