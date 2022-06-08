@@ -1,6 +1,6 @@
 # rlox-interpreter
 
-rlox-interpreter is a Rust implementation of Bob Nystrom's toy language, [Lox](https://craftinginterpreters.com/).
+rlox-interpreter is an AST-walking implementation of Bob Nystrom's [Lox](https://craftinginterpreters.com/) language in Rust.
 
 Disclaimer: This is my first Rust project, do not expect idiomatic or performant code. :wink:
 
@@ -23,7 +23,7 @@ Execute a Lox script:
 ## Benchmarks
 
 rlox-interpreter is implemented as an AST-walking interpreter. Here are some execution times from running each of the
-benchmarks on an AMD Ryzen 7 Pro 5850U. For comparison there are also the execution times for Bob Nystroms AST-walking
+benchmarks on an AMD Ryzen 7 Pro 5850U. For comparison there are also the execution times for Bob Nystrom's AST-walking
 interpreter (which is programmed in Java).
 
 |                     | rlox-interpreter | jlox     | rlox-interpreter/jlox |
